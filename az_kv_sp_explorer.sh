@@ -1,41 +1,36 @@
 #!/usr/bin/env bash
 # az_kv_sp_explorer.sh
-# Interactive tool to:
-#  - login as a Service Principal (SP) with progress messages
-#  - detect existing az session and log out before a new login
-#  - list key vaults
-#  - list secrets (names)
-#  - optionally fetch a secret value (explicit confirmation)
-#  - optionally attempt az login as another principal/user using that value as password
-#  - write operational logs to script.log (no secret values by default)
-#  - write username metadata to readPass.log when a password is extracted/used
-#
-# Usage: ./az_kv_sp_explorer.sh
-# Requirements: Azure CLI (az). jq recommended (optional).
+# Login as SP, list vaults, show secrets as a table, fetch values on demand,
+# optionally try logging in as another user/SP using a fetched value.
+# Logs to script.log (no secret values by default) and readPass.log (usernames only).
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
+# --- Hard require Bash (avoid dash/sh arithmetic and [[ ]] errors) ---
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "This script must be run with bash. Try: bash $0" >&2
+  exit 1
+fi
+
 LOG_FILE="./script.log"
 READPASS_LOG="./readPass.log"
-TMP_JSON="/tmp/az_kv_sp_explorer.tmp.json"
-JQ="$(command -v jq || true)"
+TMP_DIR="/tmp/az_kv_sp_explorer.$$"
+mkdir -p "$TMP_DIR"
+trap 'rm -rf "$TMP_DIR"' EXIT
 
-# Do NOT log secret values by default (override with: export LOG_SECRET_VALUES=true)
+# Do NOT log secret values by default. Override: export LOG_SECRET_VALUES=true
 LOG_SECRET_VALUES="${LOG_SECRET_VALUES:-false}"
 
-# Timeout (seconds) for az commands (override: export AZ_CMD_TIMEOUT_SECONDS=45)
+# Timeout for az calls (seconds). Override with env if desired.
 AZ_CMD_TIMEOUT_SECONDS="${AZ_CMD_TIMEOUT_SECONDS:-30}"
 
 timestamp(){ date +"%Y-%m-%d %H:%M:%S"; }
 log(){ echo "$(timestamp) - $*" | tee -a "$LOG_FILE"; }
 err(){ echo "$(timestamp) - ERROR - $*" | tee -a "$LOG_FILE" >&2; }
 
-cleanup(){ rm -f "$TMP_JSON" "$TMP_JSON.value" || true; }
-trap cleanup EXIT
-
-# ---------------- Utility wrappers ----------------
+say(){ echo "[ $(timestamp) ] $*" >&2; }
 
 run_az() {
   # usage: run_az "desc" -- <cmd> [args...]
@@ -46,49 +41,40 @@ run_az() {
   fi
   shift
   log "START: ${desc}"
-  echo "[ $(timestamp) ] ${desc} ..." 1>&2
+  say "${desc} ..."
   if command -v timeout >/dev/null 2>&1; then
     if timeout "${AZ_CMD_TIMEOUT_SECONDS}s" "$@" >>"$LOG_FILE" 2>&1; then
       log "OK: ${desc}"
-      echo "[ $(timestamp) ] ${desc} ... OK" 1>&2
+      say "${desc} ... OK"
       return 0
     else
       log "FAIL/Timeout: ${desc}"
-      echo "[ $(timestamp) ] ${desc} ... FAIL or TIMEOUT" 1>&2
+      say "${desc} ... FAIL or TIMEOUT"
       return 1
     fi
   else
     if "$@" >>"$LOG_FILE" 2>&1; then
       log "OK: ${desc}"
-      echo "[ $(timestamp) ] ${desc} ... OK" 1>&2
+      say "${desc} ... OK"
       return 0
     else
       log "FAIL: ${desc}"
-      echo "[ $(timestamp) ] ${desc} ... FAIL" 1>&2
+      say "${desc} ... FAIL"
       return 1
     fi
   fi
 }
 
 already_logged_in() {
-  if az account show >/dev/null 2>&1; then
-    return 0
-  else
-    return 1
-  fi
+  az account show >/dev/null 2>&1
 }
 
 logout_if_logged_in() {
   if already_logged_in; then
-    log "Existing az session detected. Logging out before new login per policy."
-    echo "[ $(timestamp) ] Logging out existing Azure session..." 1>&2
+    log "Existing az session detected. Logging out first."
+    say "Logging out existing Azure session..."
     run_az "az logout" -- az logout || true
   fi
-}
-
-show_last_log_lines() {
-  echo "----- last 40 lines of $LOG_FILE -----"
-  tail -n 40 "$LOG_FILE" || true
 }
 
 # ---------------- Login flows ----------------
@@ -100,25 +86,24 @@ sp_login_interactive() {
   read -r -s -p "Service Principal Password (password): " SP_PASS ; echo
   read -r -p "Tenant ID (or domain): " SP_TENANT
 
-  echo "[ $(timestamp) ] Checking current az session..." 1>&2
+  say "Checking current az session..."
   logout_if_logged_in
 
   log "Attempting SP login for appId $SP_APPID (tenant $SP_TENANT)"
-  echo "[ $(timestamp) ] Running az login (SP) ..." 1>&2
+  say "Running az login (SP)..."
   if run_az "az login (SP)" -- az login --service-principal \
-         --username "$SP_APPID" \
-         --password "$SP_PASS" \
-         --tenant   "$SP_TENANT"
+        --username "$SP_APPID" \
+        --password "$SP_PASS" \
+        --tenant   "$SP_TENANT"
   then
     log "SP login succeeded for $SP_APPID"
-    echo "[ $(timestamp) ] Logged in as SP: $SP_APPID" 1>&2
-    # Show a short account summary to user (to prove we're in)
-    echo "[ $(timestamp) ] Fetching az account summary..." 1>&2
+    say "Logged in as SP: $SP_APPID"
+    say "Account summary:"
     az account show --output table 2>/dev/null | tee -a "$LOG_FILE"
     return 0
   else
-    err "SP login FAILED or timed out for $SP_APPID (see $LOG_FILE)"
-    show_last_log_lines
+    err "SP login FAILED or timed out for $SP_APPID"
+    tail -n 40 "$LOG_FILE" || true
     return 1
   fi
 }
@@ -128,21 +113,21 @@ login_with_secret_value_as_user() {
   local secret_value="$2"
   local context_msg="${3:-}"
 
-  echo "[ $(timestamp) ] Checking current az session before target login..." 1>&2
+  say "Preparing to login as: $try_user ($context_msg)"
   logout_if_logged_in
 
   log "Attempting az login as $try_user ${context_msg:+($context_msg)}"
-  echo "[ $(timestamp) ] Running az login for user/SP: $try_user ..." 1>&2
+  say "Running az login for $try_user ..."
   if run_az "az login (target $try_user)" -- az login -u "$try_user" -p "$secret_value"
   then
     log "Login succeeded for $try_user"
-    echo "[ $(timestamp) ] Login succeeded for $try_user" 1>&2
-    echo "[ $(timestamp) ] Current account:" 1>&2
+    say "Login succeeded for $try_user"
+    say "Current account:"
     az account show --output table 2>/dev/null | tee -a "$LOG_FILE"
     return 0
   else
     err "Login failed or timed out for $try_user"
-    show_last_log_lines
+    tail -n 40 "$LOG_FILE" || true
     return 1
   fi
 }
@@ -151,37 +136,52 @@ login_with_secret_value_as_user() {
 
 choose_subscription() {
   if ! already_logged_in; then
-    err "No active account info available. Please login first."
+    err "No active account info. Please login first."
     return 1
   fi
 
-  run_az "az account list" -- az account list --output json || { err "Unable to list subscriptions"; return 1; }
-  cp "$LOG_FILE" "$LOG_FILE.tmp" 2>/dev/null || true
-  # Extract the last JSON blob from the log into TMP_JSON
-  awk '/^\[/,/\]$/' "$LOG_FILE.tmp" > "$TMP_JSON" || true
-  rm -f "$LOG_FILE.tmp" || true
+  local subs_json="$TMP_DIR/subs.json"
+  if ! az account list --output json >"$subs_json" 2>>"$LOG_FILE"; then
+    err "Unable to list subscriptions"
+    return 1
+  fi
 
-  if [[ -n "$JQ" && -s "$TMP_JSON" ]]; then
-    local count; count=$(jq 'length' "$TMP_JSON" 2>/dev/null || echo 0)
-    if [[ "$count" -gt 1 ]]; then
-      echo "Available subscriptions:"
-      jq -r '.[] | "\(.name) | \(.id)"' "$TMP_JSON" | nl -w2 -s'. ' -v1
-      read -r -p "Enter subscription number to set (or press Enter to keep current): " sub_choice
-      if [[ -n "$sub_choice" ]]; then
-        sub_id=$(jq -r ".[$((sub_choice-1))].id" "$TMP_JSON")
-        run_az "az account set $sub_id" -- az account set --subscription "$sub_id" || { err "Unable to set subscription"; return 1; }
-        log "Set subscription to $sub_id"
-      fi
-    else
-      echo "[info] Only one (or zero) subscription visible; nothing to change."
-    fi
+  # Build arrays of names & ids.
+  mapfile -t SUB_NAMES < <(jq -r '.[].name' "$subs_json" 2>/dev/null || echo)
+  mapfile -t SUB_IDS   < <(jq -r '.[].id'   "$subs_json" 2>/dev/null || echo)
+
+  if ((${#SUB_IDS[@]} <= 1)); then
+    say "One or zero subscriptions visible; nothing to change."
+    return 0
+  fi
+
+  echo "Available subscriptions:"
+  for i in "${!SUB_IDS[@]}"; do
+    printf "%2d) %s | %s\n" $((i+1)) "${SUB_NAMES[$i]}" "${SUB_IDS[$i]}"
+  done
+
+  read -r -p "Enter subscription number to set (or press Enter to keep current): " sub_choice
+  if [[ -z "$sub_choice" ]]; then
+    say "Keeping current subscription."
+    return 0
+  fi
+  if [[ ! "$sub_choice" =~ ^[0-9]+$ ]]; then
+    err "Invalid selection (not a number)."
+    return 1
+  fi
+
+  local idx=$((sub_choice-1))
+  if (( idx < 0 || idx >= ${#SUB_IDS[@]} )); then
+    err "Invalid selection (out of range)."
+    return 1
+  fi
+
+  local sub_id="${SUB_IDS[$idx]}"
+  if run_az "az account set $sub_id" -- az account set --subscription "$sub_id"; then
+    log "Active subscription set to $sub_id"
   else
-    az account list --output table | tee -a "$LOG_FILE"
-    read -r -p "If you want to set a subscription now, paste its ID (or press Enter to skip): " sub_id
-    if [[ -n "$sub_id" ]]; then
-      run_az "az account set $sub_id" -- az account set --subscription "$sub_id" || { err "Unable to set subscription"; return 1; }
-      log "Set subscription to $sub_id"
-    fi
+    err "Failed to set subscription"
+    return 1
   fi
 }
 
@@ -191,78 +191,87 @@ select_vault() {
     return 1
   fi
 
-  if ! run_az "az keyvault list" -- az keyvault list --output json; then
+  local vaults_json="$TMP_DIR/vaults.json"
+  if ! az keyvault list --output json > "$vaults_json" 2>>"$LOG_FILE"; then
     err "Failed to list vaults"
     return 1
   fi
 
-  # Pull the last JSON array from log into TMP_JSON
-  awk '/^\[/,/\]$/' "$LOG_FILE" | tail -n +1 > "$TMP_JSON" || true
+  mapfile -t VAULT_NAMES < <(jq -r '.[].name' "$vaults_json" 2>/dev/null || echo)
+  mapfile -t VAULT_URIS  < <(jq -r '.[].properties.vaultUri // ""' "$vaults_json" 2>/dev/null || echo)
 
-  if [[ -n "$JQ" && -s "$TMP_JSON" ]]; then
-    local n; n=$(jq 'length' "$TMP_JSON" 2>/dev/null || echo 0)
-    if [[ "$n" -eq 0 ]]; then
-      echo "No Key Vaults found or insufficient permissions."
-      return 1
-    fi
-    echo "Key Vaults:"
-    jq -r '.[] | .name + " (" + (.properties.vaultUri // "") + ")"' "$TMP_JSON" | nl -w2 -s'. ' -v1
-    read -r -p "Choose vault number (or q to cancel): " vchoice
-    [[ "$vchoice" == "q" ]] && return 2
-    VAULT_NAME="$(jq -r ".[$((vchoice-1))].name" "$TMP_JSON")"
-  else
-    az keyvault list --output table | tee -a "$LOG_FILE"
-    read -r -p "Enter vault name to inspect (or q to cancel): " VAULT_NAME
-    [[ "$VAULT_NAME" == "q" ]] && return 2
-  fi
-
-  if [[ -z "${VAULT_NAME:-}" || "$VAULT_NAME" == "null" ]]; then
-    err "Invalid vault selection"
+  if ((${#VAULT_NAMES[@]} == 0)); then
+    echo "No Key Vaults found or insufficient permissions."
     return 1
   fi
+
+  echo "Key Vaults:"
+  for i in "${!VAULT_NAMES[@]}"; do
+    printf "%2d) %s (%s)\n" $((i+1)) "${VAULT_NAMES[$i]}" "${VAULT_URIS[$i]}"
+  done
+
+  read -r -p "Choose vault number (or q to cancel): " vchoice
+  [[ "$vchoice" == "q" ]] && return 2
+  if [[ ! "$vchoice" =~ ^[0-9]+$ ]]; then
+    err "Invalid selection (not a number)."
+    return 1
+  fi
+
+  local idx=$((vchoice-1))
+  if (( idx < 0 || idx >= ${#VAULT_NAMES[@]} )); then
+    err "Invalid selection (out of range)."
+    return 1
+  fi
+
+  VAULT_NAME="${VAULT_NAMES[$idx]}"
   log "Selected vault: $VAULT_NAME"
+  echo "Selected vault: $VAULT_NAME"
   return 0
 }
 
 select_secret_in_vault() {
   local vault="$1"
-  if ! run_az "az keyvault secret list ($vault)" -- az keyvault secret list --vault-name "$vault" --query "[].name" -o tsv; then
-    err "Failed to list secrets for $vault"
+
+  # Show the table the way you requested:
+  say "Listing secrets (table) for vault: $vault"
+  az keyvault secret list --vault-name "$vault" --query "[].{Name:name}" -o table 2>>"$LOG_FILE" || {
+    err "Failed to list secrets (table) for $vault"
+    return 1
+  }
+
+  # Build a numbered selection list from the names (TSV for clean parsing):
+  local secrets_tsv="$TMP_DIR/secrets.tsv"
+  if ! az keyvault secret list --vault-name "$vault" --query "[].name" -o tsv > "$secrets_tsv" 2>>"$LOG_FILE"; then
+    err "Failed to list secret names for $vault"
     return 1
   fi
 
-  # Grab the last TSV lines from the log for names
-  awk '/START: az keyvault secret list/,0' "$LOG_FILE" | tail -n +1 >/dev/null 2>&1 # noop to move cursor
-  # Safer: re-run the command directly (to file) without cluttering log again:
-  if ! az keyvault secret list --vault-name "$vault" --query "[].name" -o tsv > "$TMP_JSON" 2>>"$LOG_FILE"; then
-    err "Failed to retrieve secret names for $vault"
-    return 1
-  fi
-
-  mapfile -t secret_names < "$TMP_JSON"
-  if [[ ${#secret_names[@]} -eq 0 ]]; then
+  mapfile -t SECRET_NAMES < "$secrets_tsv"
+  if ((${#SECRET_NAMES[@]} == 0)); then
     echo "No secrets found or insufficient permissions."
     return 1
   fi
 
-  echo "Secrets in $vault:"
-  for i in "${!secret_names[@]}"; do
-    printf "%2d) %s\n" $((i+1)) "${secret_names[$i]}"
+  echo
+  echo "Select a secret by number to fetch its VALUE, or choose:"
+  echo "  a) Fetch ALL values (display only; high risk)"
+  echo "  q) Back"
+  echo
+  for i in "${!SECRET_NAMES[@]}"; do
+    printf "%2d) %s\n" $((i+1)) "${SECRET_NAMES[$i]}"
   done
-  read -r -p "Choose a secret number (or 'a' to fetch all values, q to cancel): " scol
+
+  read -r -p "Your choice: " scol
   [[ "$scol" == "q" ]] && return 2
 
   if [[ "$scol" == "a" ]]; then
-    read -r -p "Fetch ALL values? This will display values in terminal. Proceed? [y/N]: " confirm_all
+    read -r -p "Fetch ALL values and display on screen? [y/N]: " confirm_all
     if [[ "$confirm_all" =~ ^[Yy]$ ]]; then
-      for s in "${secret_names[@]}"; do
-        if run_az "az keyvault secret show ($s)" -- az keyvault secret show --vault-name "$vault" --name "$s" --query 'value' -o tsv; then
-          # Fetch value into file directly to avoid parsing from log
-          if az keyvault secret show --vault-name "$vault" --name "$s" --query 'value' -o tsv > "$TMP_JSON.value" 2>>"$LOG_FILE"; then
-            val="$(cat "$TMP_JSON.value")"
-            echo "SECRET: $s = $val"
-            [[ "$LOG_SECRET_VALUES" == "true" ]] && log "SECRET_VALUE: $s = $val"
-          fi
+      for s in "${SECRET_NAMES[@]}"; do
+        if az keyvault secret show --vault-name "$vault" --name "$s" --query 'value' -o tsv > "$TMP_DIR/val" 2>>"$LOG_FILE"; then
+          val="$(cat "$TMP_DIR/val")"
+          echo "SECRET: $s = $val"
+          [[ "$LOG_SECRET_VALUES" == "true" ]] && log "SECRET_VALUE: $s = $val"
         else
           echo "Failed: $s"
           log "Failed reading secret $s from $vault"
@@ -274,13 +283,18 @@ select_secret_in_vault() {
     return 0
   fi
 
-  # single selection
-  idx=$((scol-1))
-  if (( idx < 0 || idx >= ${#secret_names[@]} )); then
-    err "Invalid selection"
+  if [[ ! "$scol" =~ ^[0-9]+$ ]]; then
+    err "Invalid selection (not a number)."
     return 1
   fi
-  SECRET_NAME="${secret_names[$idx]}"
+
+  local idx=$((scol-1))
+  if (( idx < 0 || idx >= ${#SECRET_NAMES[@]} )); then
+    err "Invalid selection (out of range)."
+    return 1
+  fi
+
+  SECRET_NAME="${SECRET_NAMES[$idx]}"
   log "Selected secret: $SECRET_NAME"
   return 0
 }
@@ -291,66 +305,50 @@ inspect_secret_and_maybe_login() {
   echo
   echo "Secret: $secret in vault: $vault"
   echo "Options:"
-  echo "  1) Show metadata only"
-  echo "  2) Fetch secret VALUE (requires explicit confirm)"
-  echo "  3) Fetch value and attempt az login as another user (interactive)"
-  echo "  4) Go back"
-  read -r -p "Choose 1-4: " opt
+  echo "  1) Fetch and show secret VALUE"
+  echo "  2) Fetch value and attempt az login as another user/SP"
+  echo "  3) Back"
+  read -r -p "Choose 1-3: " opt
+
   case "$opt" in
     1)
-      az keyvault secret show --vault-name "$vault" --name "$secret" --output json | sed -n '1,200p'
-      log "Displayed metadata for $secret in $vault"
-      ;;
-    2)
-      read -r -p "Fetch secret value? This will print the value to your terminal. Proceed [y/N]: " c2
-      if [[ "$c2" =~ ^[Yy]$ ]]; then
-        if az keyvault secret show --vault-name "$vault" --name "$secret" --query 'value' -o tsv > "$TMP_JSON.value" 2>>"$LOG_FILE"; then
-          secret_value="$(cat "$TMP_JSON.value")"
-          echo "VALUE: $secret_value"
-          log "Fetched secret $secret (value displayed in terminal on user confirmation)"
-          [[ "$LOG_SECRET_VALUES" == "true" ]] && log "SECRET_VALUE: $secret = $secret_value"
-          read -r -p "Do you want to mark an account username to $READPASS_LOG for follow-up? (enter username or leave blank): " assoc_user
-          if [[ -n "$assoc_user" ]]; then
-            echo "$(timestamp) - $assoc_user - secret:$secret - vault:$vault" >> "$READPASS_LOG"
-            log "Marked $assoc_user in $READPASS_LOG"
-          fi
-          unset secret_value
-          rm -f "$TMP_JSON.value" || true
-        else
-          err "Failed to fetch secret value for $secret"
+      if az keyvault secret show --vault-name "$vault" --name "$secret" --query 'value' -o tsv > "$TMP_DIR/val" 2>>"$LOG_FILE"; then
+        secret_value="$(cat "$TMP_DIR/val")"
+        echo "VALUE: $secret_value"
+        log "Fetched secret $secret (value displayed on-screen)"
+        [[ "$LOG_SECRET_VALUES" == "true" ]] && log "SECRET_VALUE: $secret = $secret_value"
+        read -r -p "Mark an account username to $READPASS_LOG for follow-up? (enter username or leave blank): " assoc_user
+        if [[ -n "$assoc_user" ]]; then
+          echo "$(timestamp) - $assoc_user - secret:$secret - vault:$vault" >> "$READPASS_LOG"
+          log "Marked $assoc_user in $READPASS_LOG"
         fi
+        unset secret_value
+        rm -f "$TMP_DIR/val" || true
       else
-        echo "Cancelled."
+        err "Failed to fetch value for $secret"
       fi
       ;;
-    3)
-      read -r -p "Fetch secret value and attempt login? Proceed [y/N]: " c3
-      if [[ "$c3" =~ ^[Yy]$ ]]; then
-        if az keyvault secret show --vault-name "$vault" --name "$secret" --query 'value' -o tsv > "$TMP_JSON.value" 2>>"$LOG_FILE"; then
-          secret_value="$(cat "$TMP_JSON.value")"
-          echo "Fetched secret value (not logged)."
-          read -r -p "Enter username (UPN) or SP appId to attempt az login as: " try_user
-          if [[ -z "$try_user" ]]; then
-            err "No username provided. Aborting attempt."
-          else
-            # logout first per policy, then try login with secret value
-            if login_with_secret_value_as_user "$try_user" "$secret_value" "from secret:$secret vault:$vault"; then
-              # success: add to readPass.log
-              echo "$(timestamp) - $try_user - password_extracted_from:$secret - vault:$vault" >> "$READPASS_LOG"
-              log "Wrote $try_user record to $READPASS_LOG"
-            fi
-          fi
-          unset secret_value
-          rm -f "$TMP_JSON.value" || true
+    2)
+      if az keyvault secret show --vault-name "$vault" --name "$secret" --query 'value' -o tsv > "$TMP_DIR/val" 2>>"$LOG_FILE"; then
+        secret_value="$(cat "$TMP_DIR/val")"
+        echo "Fetched secret value (not logged)."
+        read -r -p "Enter username (UPN) or SP appId to attempt az login as: " try_user
+        if [[ -z "$try_user" ]]; then
+          err "No username provided. Aborting attempt."
         else
-          err "Failed to fetch secret value for $secret"
+          if login_with_secret_value_as_user "$try_user" "$secret_value" "from secret:$secret vault:$vault"; then
+            echo "$(timestamp) - $try_user - password_extracted_from:$secret - vault:$vault" >> "$READPASS_LOG"
+            log "Wrote $try_user record to $READPASS_LOG"
+          fi
         fi
+        unset secret_value
+        rm -f "$TMP_DIR/val" || true
       else
-        echo "Cancelled."
+        err "Failed to fetch value for $secret"
       fi
       ;;
     *)
-      echo "Going back."
+      echo "Back."
       ;;
   esac
 }
@@ -363,7 +361,7 @@ main_menu() {
     echo "Main Menu:"
     echo "  1) SP Login (service-principal)"
     echo "  2) Choose subscription"
-    echo "  3) List vaults and inspect secrets"
+    echo "  3) List vaults -> show secrets table -> fetch/act"
     echo "  4) Show logs (last 200 lines)"
     echo "  5) Logout (if logged in)"
     echo "  6) Exit"
@@ -390,9 +388,9 @@ main_menu() {
       5)
         if already_logged_in; then
           logout_if_logged_in
-          echo "[ $(timestamp) ] Logged out." 1>&2
+          say "Logged out."
         else
-          echo "[ $(timestamp) ] No active session." 1>&2
+          say "No active session."
         fi
         ;;
       6)
@@ -407,7 +405,6 @@ main_menu() {
 }
 
 # ---------------- Start ----------------
-
 log "Script started by $(whoami)"
 if ! command -v az >/dev/null 2>&1; then
   err "az CLI not found. Install azure-cli and retry."
