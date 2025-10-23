@@ -8,7 +8,7 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-# --- Hard require Bash (avoid dash/sh arithmetic and [[ ]] errors) ---
+# --- Require Bash explicitly (avoid sh/dash issues) ---
 if [ -z "${BASH_VERSION:-}" ]; then
   echo "This script must be run with bash. Try: bash $0" >&2
   exit 1
@@ -23,13 +23,12 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 # Do NOT log secret values by default. Override: export LOG_SECRET_VALUES=true
 LOG_SECRET_VALUES="${LOG_SECRET_VALUES:-false}"
 
-# Timeout for az calls (seconds). Override with env if desired.
+# Timeout for az calls (seconds). Override with: export AZ_CMD_TIMEOUT_SECONDS=45
 AZ_CMD_TIMEOUT_SECONDS="${AZ_CMD_TIMEOUT_SECONDS:-30}"
 
 timestamp(){ date +"%Y-%m-%d %H:%M:%S"; }
 log(){ echo "$(timestamp) - $*" | tee -a "$LOG_FILE"; }
 err(){ echo "$(timestamp) - ERROR - $*" | tee -a "$LOG_FILE" >&2; }
-
 say(){ echo "[ $(timestamp) ] $*" >&2; }
 
 run_az() {
@@ -65,9 +64,7 @@ run_az() {
   fi
 }
 
-already_logged_in() {
-  az account show >/dev/null 2>&1
-}
+already_logged_in() { az account show >/dev/null 2>&1; }
 
 logout_if_logged_in() {
   if already_logged_in; then
@@ -146,9 +143,19 @@ choose_subscription() {
     return 1
   fi
 
-  # Build arrays of names & ids.
-  mapfile -t SUB_NAMES < <(jq -r '.[].name' "$subs_json" 2>/dev/null || echo)
-  mapfile -t SUB_IDS   < <(jq -r '.[].id'   "$subs_json" 2>/dev/null || echo)
+  if ! command -v jq >/dev/null 2>&1; then
+    say "jq not found; showing raw table instead."
+    az account list --output table | tee -a "$LOG_FILE"
+    read -r -p "Paste subscription ID to set (or Enter to keep current): " sub_id
+    if [[ -n "$sub_id" ]]; then
+      run_az "az account set $sub_id" -- az account set --subscription "$sub_id" || { err "Unable to set subscription"; return 1; }
+      log "Active subscription set to $sub_id"
+    fi
+    return 0
+  fi
+
+  mapfile -t SUB_NAMES < <(jq -r '.[].name' "$subs_json")
+  mapfile -t SUB_IDS   < <(jq -r '.[].id'   "$subs_json")
 
   if ((${#SUB_IDS[@]} <= 1)); then
     say "One or zero subscriptions visible; nothing to change."
@@ -156,7 +163,7 @@ choose_subscription() {
   fi
 
   echo "Available subscriptions:"
-  for i in "${!SUB_IDS[@]}"; do
+  for ((i=0; i<${#SUB_IDS[@]}; i++)); do
     printf "%2d) %s | %s\n" $((i+1)) "${SUB_NAMES[$i]}" "${SUB_IDS[$i]}"
   done
 
@@ -169,20 +176,14 @@ choose_subscription() {
     err "Invalid selection (not a number)."
     return 1
   fi
-
   local idx=$((sub_choice-1))
   if (( idx < 0 || idx >= ${#SUB_IDS[@]} )); then
     err "Invalid selection (out of range)."
     return 1
   fi
-
   local sub_id="${SUB_IDS[$idx]}"
-  if run_az "az account set $sub_id" -- az account set --subscription "$sub_id"; then
-    log "Active subscription set to $sub_id"
-  else
-    err "Failed to set subscription"
-    return 1
-  fi
+  run_az "az account set $sub_id" -- az account set --subscription "$sub_id" || { err "Unable to set subscription"; return 1; }
+  log "Active subscription set to $sub_id"
 }
 
 select_vault() {
@@ -197,17 +198,32 @@ select_vault() {
     return 1
   fi
 
-  mapfile -t VAULT_NAMES < <(jq -r '.[].name' "$vaults_json" 2>/dev/null || echo)
-  mapfile -t VAULT_URIS  < <(jq -r '.[].properties.vaultUri // ""' "$vaults_json" 2>/dev/null || echo)
+  # If jq is missing, fall back to table + manual name entry
+  if ! command -v jq >/dev/null 2>&1; then
+    say "jq not found; showing vaults in table. Enter vault name manually."
+    az keyvault list --output table | tee -a "$LOG_FILE"
+    read -r -p "Enter vault name to inspect (or q to cancel): " VAULT_NAME
+    [[ "${VAULT_NAME:-}" == "q" ]] && return 2
+    if [[ -z "${VAULT_NAME:-}" ]]; then err "Empty vault name."; return 1; fi
+    log "Selected vault: $VAULT_NAME"
+    echo "Selected vault: $VAULT_NAME"
+    return 0
+  fi
+
+  # Normal path with jq
+  mapfile -t VAULT_NAMES < <(jq -r '.[].name' "$vaults_json")
+  mapfile -t VAULT_URIS  < <(jq -r '.[].properties.vaultUri // ""' "$vaults_json")
 
   if ((${#VAULT_NAMES[@]} == 0)); then
     echo "No Key Vaults found or insufficient permissions."
     return 1
   fi
 
+  # Print with safe defaults to avoid unbound variable on URIs
   echo "Key Vaults:"
-  for i in "${!VAULT_NAMES[@]}"; do
-    printf "%2d) %s (%s)\n" $((i+1)) "${VAULT_NAMES[$i]}" "${VAULT_URIS[$i]}"
+  for ((i=0; i<${#VAULT_NAMES[@]}; i++)); do
+    uri="${VAULT_URIS[$i]:-}"
+    printf "%2d) %s (%s)\n" $((i+1)) "${VAULT_NAMES[$i]}" "$uri"
   done
 
   read -r -p "Choose vault number (or q to cancel): " vchoice
@@ -216,7 +232,6 @@ select_vault() {
     err "Invalid selection (not a number)."
     return 1
   fi
-
   local idx=$((vchoice-1))
   if (( idx < 0 || idx >= ${#VAULT_NAMES[@]} )); then
     err "Invalid selection (out of range)."
@@ -232,20 +247,19 @@ select_vault() {
 select_secret_in_vault() {
   local vault="$1"
 
-  # Show the table the way you requested:
+  # Show your requested table view
   say "Listing secrets (table) for vault: $vault"
   az keyvault secret list --vault-name "$vault" --query "[].{Name:name}" -o table 2>>"$LOG_FILE" || {
     err "Failed to list secrets (table) for $vault"
     return 1
   }
 
-  # Build a numbered selection list from the names (TSV for clean parsing):
+  # Build a numbered list for selection from TSV (names only)
   local secrets_tsv="$TMP_DIR/secrets.tsv"
   if ! az keyvault secret list --vault-name "$vault" --query "[].name" -o tsv > "$secrets_tsv" 2>>"$LOG_FILE"; then
     err "Failed to list secret names for $vault"
     return 1
   fi
-
   mapfile -t SECRET_NAMES < "$secrets_tsv"
   if ((${#SECRET_NAMES[@]} == 0)); then
     echo "No secrets found or insufficient permissions."
@@ -257,7 +271,7 @@ select_secret_in_vault() {
   echo "  a) Fetch ALL values (display only; high risk)"
   echo "  q) Back"
   echo
-  for i in "${!SECRET_NAMES[@]}"; do
+  for ((i=0; i<${#SECRET_NAMES[@]}; i++)); do
     printf "%2d) %s\n" $((i+1)) "${SECRET_NAMES[$i]}"
   done
 
@@ -287,7 +301,6 @@ select_secret_in_vault() {
     err "Invalid selection (not a number)."
     return 1
   fi
-
   local idx=$((scol-1))
   if (( idx < 0 || idx >= ${#SECRET_NAMES[@]} )); then
     err "Invalid selection (out of range)."
@@ -367,12 +380,8 @@ main_menu() {
     echo "  6) Exit"
     read -r -p "Choose 1-6: " m
     case "$m" in
-      1)
-        sp_login_interactive || echo "SP login failed; check $LOG_FILE"
-        ;;
-      2)
-        choose_subscription
-        ;;
+      1) sp_login_interactive || echo "SP login failed; check $LOG_FILE" ;;
+      2) choose_subscription ;;
       3)
         select_vault || { echo "No vault selected or error."; continue; }
         select_secret_in_vault "$VAULT_NAME" || continue
@@ -397,9 +406,7 @@ main_menu() {
         log "Exiting."
         break
         ;;
-      *)
-        echo "Invalid option"
-        ;;
+      *) echo "Invalid option" ;;
     esac
   done
 }
