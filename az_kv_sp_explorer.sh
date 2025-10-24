@@ -5,14 +5,12 @@
 #
 # Optional config file:
 #   Path (default): ./az_kv_sp_explorer.conf
-#   Format: simple KEY=VALUE lines (no quotes needed). Supported keys:
+#   Format: KEY=VALUE (no quotes). Supported keys:
 #     TENANT_ID=00000000-0000-0000-0000-000000000000
-#     DEFAULT_SUBSCRIPTION_ID=<sub-id>          # (not auto-used; for future use)
-#     LOG_SECRET_VALUES=false                   # true|false (default false)
-#     AZ_CMD_TIMEOUT_SECONDS=30                 # integer seconds
+#     LOG_SECRET_VALUES=false
+#     AZ_CMD_TIMEOUT_SECONDS=30
 #
 # Example:
-#   # az_kv_sp_explorer.conf
 #   TENANT_ID=11111111-2222-3333-4444-555555555555
 #   LOG_SECRET_VALUES=false
 #   AZ_CMD_TIMEOUT_SECONDS=45
@@ -45,33 +43,23 @@ CONFIG_FILE="${CONFIG_FILE:-./az_kv_sp_explorer.conf}"
 
 # State
 CURRENT_LOGIN="unset"
-
-# Navigation signal bubbles up without non-zero returns
-# "" = none, "MAIN" = return to Main Menu, "VAULTS" = return to vault list
 NAV_SIGNAL=""
 
-# Capture-next-action state
-CAPTURE_NEXT="false"     # pending capture enabled for the NEXT menu action
-CAPTURE_ACTIVE="false"   # true only while an action is running with capture on
-CAPTURE_FILE=""          # filename to capture next action
-CAPTURE_FD=""            # saved stdout FD during capture
+# ===== Persistent capture (session-wide) =====
+CAPTURE_ENABLED="false"   # when true, stdout & stderr are mirrored to CAPTURE_FILE
+CAPTURE_FILE=""           # target file
+CAPTURE_OUT_FD=""         # saved stdout FD
+CAPTURE_ERR_FD=""         # saved stderr FD
 
-# ----- Logging helpers -----
 timestamp(){ date +"%Y-%m-%d %H:%M:%S"; }
-# Log to file with timestamp; no terminal echo here
+# Log to file only (with timestamps)
 log(){ echo "$(timestamp) - user:${CURRENT_LOGIN} - $*" >>"$LOG_FILE"; }
 err(){ echo "$(timestamp) - user:${CURRENT_LOGIN} - ERROR - $*" >>"$LOG_FILE"; }
-# Clean terminal output (no timestamps). While capturing, also mirror to stdout.
-say(){
-  if [[ "${CAPTURE_ACTIVE}" == "true" ]]; then
-    echo "$*"
-  fi
-  echo "$*" >&2
-}
+# Clean terminal output (no timestamps)
+say(){ echo "$*" >&2; }
 
 # ----- Load config (safe parser for KEY=VALUE lines) -----
 TENANT_ID_CFG="${TENANT_ID_CFG:-}"
-DEFAULT_SUBSCRIPTION_ID_CFG="${DEFAULT_SUBSCRIPTION_ID_CFG:-}"
 load_config() {
   if [[ -f "$CONFIG_FILE" ]]; then
     while IFS='=' read -r key val; do
@@ -80,7 +68,6 @@ load_config() {
       [[ -z "$key" || "$key" =~ ^# ]] && continue
       case "$key" in
         TENANT_ID) TENANT_ID_CFG="$val" ;;
-        DEFAULT_SUBSCRIPTION_ID) DEFAULT_SUBSCRIPTION_ID_CFG="$val" ;;
         LOG_SECRET_VALUES) LOG_SECRET_VALUES="$val" ;;
         AZ_CMD_TIMEOUT_SECONDS) AZ_CMD_TIMEOUT_SECONDS="$val" ;;
         *) : ;;
@@ -94,9 +81,7 @@ load_config() {
 log_cmd() {
   local out=""; local redact_next=0
   for arg in "$@"; do
-    if (( redact_next )); then
-      out+=" ***REDACTED***"; redact_next=0; continue
-    fi
+    if (( redact_next )); then out+=" ***REDACTED***"; redact_next=0; continue; fi
     case "$arg" in
       --password|--client-secret|-p) out+=" $(printf '%q' "$arg")"; redact_next=1 ;;
       *) out+=" $(printf '%q' "$arg")" ;;
@@ -131,60 +116,48 @@ logout_if_logged_in() {
   fi
 }
 
-# --------- Capture-next-action helpers (toggleable) ---------
-enable_capture_next() {
-  read -r -p "Enter TXT filename to capture the NEXT action output (will overwrite if exists): " CAPTURE_FILE
+# ===== Capture toggle helpers (persistent) =====
+capture_enable() {
+  read -r -p "Enter TXT filename to capture ALL terminal output (append mode): " CAPTURE_FILE
   if [[ -z "${CAPTURE_FILE:-}" ]]; then
-    say "No file provided. Capture cancelled."
-    CAPTURE_NEXT="false"
+    say "No file provided. Capture not enabled."
     return 0
   fi
-  : > "$CAPTURE_FILE" || { say "Cannot write to $CAPTURE_FILE"; CAPTURE_NEXT="false"; return 1; }
-  CAPTURE_NEXT="true"
-  say "Capture ENABLED for the NEXT menu action → $CAPTURE_FILE"
-}
+  # Touch to verify write access; we APPEND to preserve history
+  : >> "$CAPTURE_FILE" || { say "Cannot write to $CAPTURE_FILE"; CAPTURE_FILE=""; return 1; }
 
-disable_capture_next() {
-  if [[ "$CAPTURE_ACTIVE" == "true" ]]; then
-    say "Cannot disable while capture is active."
-    return 1
+  if [[ "$CAPTURE_ENABLED" == "true" ]]; then
+    say "Capture already enabled → $CAPTURE_FILE"
+    return 0
   fi
-  if [[ "$CAPTURE_NEXT" == "true" ]]; then
-    CAPTURE_NEXT="false"
-    CAPTURE_FILE=""
-    say "Capture DISABLED for the next action."
-  else
-    say "Capture already disabled."
-  fi
-}
 
-begin_capture() {
-  CAPTURE_ACTIVE="true"
+  CAPTURE_ENABLED="true"
+  # Save current stdout/stderr and redirect both through tee (append)
   # shellcheck disable=SC3028
-  exec {CAPTURE_FD}>&1
+  exec {CAPTURE_OUT_FD}>&1
+  # shellcheck disable=SC3028
+  exec {CAPTURE_ERR_FD}>&2
   exec > >(tee -a "$CAPTURE_FILE")
+  exec 2> >(tee -a "$CAPTURE_FILE" >&2)
+  say "Capture ENABLED (persistent) → $CAPTURE_FILE"
 }
 
-end_capture() {
-  # shellcheck disable=SC3030
-  exec 1>&$CAPTURE_FD
-  # shellcheck disable=SC3028
-  exec {CAPTURE_FD}>&-
-  CAPTURE_ACTIVE="false"
-  CAPTURE_NEXT="false"
-  say "Output captured to $CAPTURE_FILE"
-}
-
-run_with_optional_capture() {
-  if [[ "$CAPTURE_NEXT" == "true" ]]; then
-    begin_capture
-    "$@"
-    local rc=$?
-    end_capture
-    return $rc
-  else
-    "$@"
+capture_disable() {
+  if [[ "$CAPTURE_ENABLED" != "true" ]]; then
+    say "Capture is already disabled."
+    return 0
   fi
+  # Restore stdout/stderr
+  # shellcheck disable=SC3030
+  exec 1>&$CAPTURE_OUT_FD
+  # shellcheck disable=SC3030
+  exec 2>&$CAPTURE_ERR_FD
+  # shellcheck disable=SC3028
+  exec {CAPTURE_OUT_FD}>&-
+  # shellcheck disable=SC3028
+  exec {CAPTURE_ERR_FD}>&-
+  CAPTURE_ENABLED="false"
+  say "Capture DISABLED."
 }
 
 # ---------------- Login flow (Service Principal) ----------------
@@ -586,37 +559,35 @@ main_menu() {
     echo "  6) Show ALL vaults and their secret NAMES (no values)"
     echo "  7) Search across ALL vaults for secret NAMES matching a string and PRINT their VALUES"
     echo "  8) Exit"
-    if [[ "$CAPTURE_NEXT" == "true" ]]; then
-      echo "  9) Disable capture for NEXT action  (currently: ENABLED -> file: $CAPTURE_FILE)"
+    if [[ "$CAPTURE_ENABLED" == "true" ]]; then
+      echo "  9) Disable persistent capture  (Capture: ON → $CAPTURE_FILE)"
     else
-      echo "  9) Capture NEXT action output to a TXT file  (currently: DISABLED)"
+      echo "  9) Enable persistent capture to a TXT file  (Capture: OFF)"
     fi
     read -r -p "Choose 1-9: " m
     case "$m" in
-      1) run_with_optional_capture sp_login_interactive ;;
-      2) run_with_optional_capture choose_subscription ;;
+      1) sp_login_interactive ;;
+      2) choose_subscription ;;
       3)
         if ! already_logged_in; then say "Please login first."
-        else run_with_optional_capture vault_browser; fi
+        else vault_browser; fi
         ;;
       4)
-        if [[ "$CAPTURE_NEXT" == "true" ]]; then begin_capture; fi
         echo "----- $LOG_FILE -----"; tail -n 200 "$LOG_FILE" || true
         echo; echo "----- $READPASS_LOG -----"; tail -n 200 "$READPASS_LOG" || true
-        if [[ "$CAPTURE_NEXT" == "true" ]]; then end_capture; fi
         ;;
       5)
-        run_with_optional_capture logout_if_logged_in
+        logout_if_logged_in
         if [[ "$CURRENT_LOGIN" != "unset" ]]; then CURRENT_LOGIN="unset"; fi
         ;;
-      6) run_with_optional_capture list_all_vaults_and_secret_names ;;
-      7) run_with_optional_capture search_and_print_secret_values ;;
+      6) list_all_vaults_and_secret_names ;;
+      7) search_and_print_secret_values ;;
       8) log "Exiting."; break ;;
       9)
-        if [[ "$CAPTURE_NEXT" == "true" ]]; then
-          disable_capture_next
+        if [[ "$CAPTURE_ENABLED" == "true" ]]; then
+          capture_disable
         else
-          enable_capture_next
+          capture_enable
         fi
         ;;
       *) say "Invalid option" ;;
