@@ -11,3 +11,4 @@
 - [x] Modify so all the lines with date that are used for logs are only on the logs and not showing on the terminal to make the terminal interaction more clean. 
 - [x] Add a feature that will look inside all the vaults for secrests that contain a specific strings then print the content of the secrets that contain the specific strings. 
 - [x] Add a feature that will allow me to enable output and for the next specific query/option i select and it will output that to a txt file. 
+- [x] Add a feature that will allow me to disabled the output file from option 9 if I set it up. Also have a terminal field that show option 9 is enable when is enable and disable when is disable. 

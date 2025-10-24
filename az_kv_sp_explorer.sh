@@ -51,10 +51,10 @@ CURRENT_LOGIN="unset"
 NAV_SIGNAL=""
 
 # Capture-next-action state
-CAPTURE_NEXT="false"
-CAPTURE_ACTIVE="false"
-CAPTURE_FILE=""
-CAPTURE_FD=""
+CAPTURE_NEXT="false"     # pending capture enabled for the NEXT menu action
+CAPTURE_ACTIVE="false"   # true only while an action is running with capture on
+CAPTURE_FILE=""          # filename to capture next action
+CAPTURE_FD=""            # saved stdout FD during capture
 
 # ----- Logging helpers -----
 timestamp(){ date +"%Y-%m-%d %H:%M:%S"; }
@@ -74,9 +74,7 @@ TENANT_ID_CFG="${TENANT_ID_CFG:-}"
 DEFAULT_SUBSCRIPTION_ID_CFG="${DEFAULT_SUBSCRIPTION_ID_CFG:-}"
 load_config() {
   if [[ -f "$CONFIG_FILE" ]]; then
-    # Only parse simple KEY=VALUE (no spaces around =). Ignore comments/blank lines.
     while IFS='=' read -r key val; do
-      # Trim leading/trailing whitespace
       key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
       val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
       [[ -z "$key" || "$key" =~ ^# ]] && continue
@@ -85,7 +83,7 @@ load_config() {
         DEFAULT_SUBSCRIPTION_ID) DEFAULT_SUBSCRIPTION_ID_CFG="$val" ;;
         LOG_SECRET_VALUES) LOG_SECRET_VALUES="$val" ;;
         AZ_CMD_TIMEOUT_SECONDS) AZ_CMD_TIMEOUT_SECONDS="$val" ;;
-        *) : ;; # ignore unknown keys
+        *) : ;;
       esac
     done < "$CONFIG_FILE"
     log "Loaded config from $CONFIG_FILE (TENANT_ID present: $([[ -n "$TENANT_ID_CFG" ]] && echo yes || echo no))"
@@ -94,55 +92,32 @@ load_config() {
 
 # Log commands with safe redaction (don’t leak secrets in logs)
 log_cmd() {
-  # usage: log_cmd <prog> [args...]
-  # Redacts the token immediately after: --password | --client-secret | -p
   local out=""; local redact_next=0
   for arg in "$@"; do
     if (( redact_next )); then
-      out+=" ***REDACTED***"
-      redact_next=0
-      continue
+      out+=" ***REDACTED***"; redact_next=0; continue
     fi
     case "$arg" in
-      --password|--client-secret|-p)
-        out+=" $(printf '%q' "$arg")"
-        redact_next=1
-        ;;
-      *)
-        out+=" $(printf '%q' "$arg")"
-        ;;
+      --password|--client-secret|-p) out+=" $(printf '%q' "$arg")"; redact_next=1 ;;
+      *) out+=" $(printf '%q' "$arg")" ;;
     esac
   done
   log "CMD:${out# }"
 }
 
 run_az() {
-  # usage: run_az "desc" -- <cmd> [args...]
   local desc="$1"; shift
-  if [[ "${1:-}" != "--" ]]; then
-    err "run_az requires -- before the command"
-    return 1
-  fi
+  if [[ "${1:-}" != "--" ]]; then err "run_az requires -- before the command"; return 1; fi
   shift
   log "START: ${desc}"
   log_cmd "$@"
   say "${desc} ..."
   if command -v timeout >/dev/null 2>&1; then
-    if timeout "${AZ_CMD_TIMEOUT_SECONDS}s" "$@" >>"$LOG_FILE" 2>&1; then
-      log "OK: ${desc}"
-      return 0
-    else
-      log "FAIL/Timeout: ${desc}"
-      return 1
-    fi
+    if timeout "${AZ_CMD_TIMEOUT_SECONDS}s" "$@" >>"$LOG_FILE" 2>&1; then log "OK: ${desc}"; return 0
+    else log "FAIL/Timeout: ${desc}"; return 1; fi
   else
-    if "$@" >>"$LOG_FILE" 2>&1; then
-      log "OK: ${desc}"
-      return 0
-    else
-      log "FAIL: ${desc}"
-      return 1
-    fi
+    if "$@" >>"$LOG_FILE" 2>&1; then log "OK: ${desc}"; return 0
+    else log "FAIL: ${desc}"; return 1; fi
   fi
 }
 
@@ -156,7 +131,7 @@ logout_if_logged_in() {
   fi
 }
 
-# --------- Capture-next-action helpers ---------
+# --------- Capture-next-action helpers (toggleable) ---------
 enable_capture_next() {
   read -r -p "Enter TXT filename to capture the NEXT action output (will overwrite if exists): " CAPTURE_FILE
   if [[ -z "${CAPTURE_FILE:-}" ]]; then
@@ -167,6 +142,20 @@ enable_capture_next() {
   : > "$CAPTURE_FILE" || { say "Cannot write to $CAPTURE_FILE"; CAPTURE_NEXT="false"; return 1; }
   CAPTURE_NEXT="true"
   say "Capture ENABLED for the NEXT menu action → $CAPTURE_FILE"
+}
+
+disable_capture_next() {
+  if [[ "$CAPTURE_ACTIVE" == "true" ]]; then
+    say "Cannot disable while capture is active."
+    return 1
+  fi
+  if [[ "$CAPTURE_NEXT" == "true" ]]; then
+    CAPTURE_NEXT="false"
+    CAPTURE_FILE=""
+    say "Capture DISABLED for the next action."
+  else
+    say "Capture already disabled."
+  fi
 }
 
 begin_capture() {
@@ -187,7 +176,6 @@ end_capture() {
 }
 
 run_with_optional_capture() {
-  # usage: run_with_optional_capture <function> [args...]
   if [[ "$CAPTURE_NEXT" == "true" ]]; then
     begin_capture
     "$@"
@@ -206,7 +194,6 @@ sp_login_interactive() {
   read -r -p "Service Principal AppID (username): " SP_APPID
   read -r -s -p "Service Principal Password: " SP_PASS ; echo
 
-  # Load config and handle Tenant ID prompt/use
   load_config
   local SP_TENANT=""
   if [[ -n "${TENANT_ID_CFG:-}" ]]; then
@@ -310,7 +297,6 @@ vault_browser() {
       continue
     fi
 
-    # Initialize arrays before mapfile; use safe default on read
     local VAULT_NAMES=()
     local VAULT_URIS=()
     mapfile -t VAULT_NAMES < <(jq -r '.[].name' "$vaults_json")
@@ -368,7 +354,6 @@ secrets_browser() {
     mapfile -t SECRET_NAMES < "$secrets_tsv"
     (( ${#SECRET_NAMES[@]} == 0 )) && { say "No secrets found."; return 0; }
 
-    # Log enumeration (vault + secret name)
     for s in "${SECRET_NAMES[@]}"; do
       log "ENUM: vault:${vault} secret_name:${s}"
     done
@@ -388,7 +373,6 @@ secrets_browser() {
     local idx=$((scol-1))
     if (( idx < 0 || idx >= ${#SECRET_NAMES[@]} )); then say "Invalid selection."; continue; fi
 
-    # Into the detail loop for that secret; returns back here
     secret_detail_loop "$vault" "$idx" SECRET_NAMES || true
     if [[ "$NAV_SIGNAL" == "MAIN" ]]; then return 0; fi
     if [[ "$NAV_SIGNAL" == "VAULTS" ]]; then NAV_SIGNAL=""; return 0; fi
@@ -397,13 +381,8 @@ secrets_browser() {
 }
 
 secret_detail_loop() {
-  # argv: vault, start_index, array_name
-  local vault="$1"
-  local idx="$2"
-  local arr_name="$3"
-
-  local -n NAMES="$arr_name"
-  local total="${#NAMES[@]}"
+  local vault="$1"; local idx="$2"; local arr_name="$3"
+  local -n NAMES="$arr_name"; local total="${#NAMES[@]}"
 
   while true; do
     local secret="${NAMES[$idx]}"
@@ -414,7 +393,6 @@ secret_detail_loop() {
     echo "  n) Next   p) Previous"
     echo "  b) Back to Vaults   q) Main Menu"
     read -r -p "Choose: " opt
-
     case "$opt" in
       1)
         log_cmd az keyvault secret show --vault-name "$vault" --name "$secret" --query value -o tsv
@@ -428,94 +406,57 @@ secret_detail_loop() {
             echo "$(timestamp) - $assoc_user - secret:$secret - vault:$vault" >> "$READPASS_LOG"
             log "Marked $assoc_user in $READPASS_LOG"
           fi
-          unset secret_value
-          rm -f "$TMP_DIR/val" || true
+          unset secret_value; rm -f "$TMP_DIR/val" || true
         else
-          err "Failed to fetch value for $secret"
-          say "Failed to fetch value (see log)."
+          err "Failed to fetch value for $secret"; say "Failed to fetch value (see log)."
         fi
         ;;
-      l|L)
-        return 0
-        ;;
-      n|N)
-        if (( idx + 1 < total )); then
-          idx=$((idx+1))
-        else
-          say "Already at the last secret."
-        fi
-        ;;
-      p|P)
-        if (( idx - 1 >= 0 )); then
-          idx=$((idx-1))
-        else
-          say "Already at the first secret."
-        fi
-        ;;
-      b|B)
-        NAV_SIGNAL="VAULTS"
-        return 0
-        ;;
-      q|Q)
-        NAV_SIGNAL="MAIN"
-        return 0
-        ;;
-      *)
-        say "Invalid option."
-        ;;
+      l|L) return 0 ;;
+      n|N) if (( idx + 1 < total )); then idx=$((idx+1)); else say "Already at the last secret."; fi ;;
+      p|P) if (( idx - 1 >= 0 )); then idx=$((idx-1)); else say "Already at the first secret."; fi ;;
+      b|B) NAV_SIGNAL="VAULTS"; return 0 ;;
+      q|Q) NAV_SIGNAL="MAIN"; return 0 ;;
+      *) say "Invalid option." ;;
     esac
   done
 }
 
-# -------- Cross-vault secret name search (by substring, names only) --------
+# -------- Cross-vault search (by substring, names only) --------
 cross_vault_search() {
   read -r -p "Enter substring to find in secret names (case-insensitive): " filter_substr
   [[ -z "$filter_substr" ]] && { say "Empty filter; cancelled."; NAV_SIGNAL=""; return 0; }
   log "SEARCH_FILTER: substr:${filter_substr}"
 
-  # Get vaults
   local VAULTS_ALL=()
   if command -v jq >/dev/null 2>&1; then
     local vaults_json="$TMP_DIR/vaults_all.json"
     log_cmd az keyvault list --output json
     if ! az keyvault list --output json > "$vaults_json" 2>>"$LOG_FILE"; then
-      err "Failed to list vaults"
-      say "Failed to list vaults (see log)."
-      NAV_SIGNAL=""
-      return 1
+      err "Failed to list vaults"; say "Failed to list vaults (see log)."; NAV_SIGNAL=""; return 1
     fi
     mapfile -t VAULTS_ALL < <(jq -r '.[].name' "$vaults_json")
   else
     log_cmd az keyvault list --query "[].name" -o tsv
     if ! az keyvault list --query "[].name" -o tsv > "$TMP_DIR/vaults.tsv" 2>>"$LOG_FILE"; then
-      err "Failed to list vaults"
-      say "Failed to list vaults (see log)."
-      NAV_SIGNAL=""
-      return 1
+      err "Failed to list vaults"; say "Failed to list vaults (see log)."; NAV_SIGNAL=""; return 1
     fi
     mapfile -t VAULTS_ALL < "$TMP_DIR/vaults.tsv"
   fi
 
   (( ${#VAULTS_ALL[@]} == 0 )) && { say "No Key Vaults found."; NAV_SIGNAL=""; return 0; }
 
-  # Aggregate and display hits (names only)
-  local RES_VAULTS=()
-  local RES_SECRETS=()
-
-  echo
-  echo "=== Search results for \"$filter_substr\" across all vaults ==="
+  local RES_VAULTS=(); local RES_SECRETS=()
+  echo; echo "=== Search results for \"$filter_substr\" across all vaults ==="
   for v in "${VAULTS_ALL[@]}"; do
     log_cmd az keyvault secret list --vault-name "$v" --query "[].name" -o tsv
     if az keyvault secret list --vault-name "$v" --query "[].name" -o tsv > "$TMP_DIR/names.tsv" 2>>"$LOG_FILE"; then
       mapfile -t HITS < <(grep -iF -- "$filter_substr" "$TMP_DIR/names.tsv" || true)
       if ((${#HITS[@]} > 0)); then
-        echo
-        echo "Vault: $v"
+        echo; echo "Vault: $v"
         for nm in "${HITS[@]}"; do
           printf "  - %s\n" "$nm"
           log "ENUM_SEARCH: vault:${v} secret_name:${nm} substr:${filter_substr}"
-          RES_VAULTS+=("$v")
-          RES_SECRETS+=("$nm")
+          RES_VAULTS+=("$v"); RES_SECRETS+=("$nm")
         done
       fi
     else
@@ -524,16 +465,11 @@ cross_vault_search() {
   done
 
   if ((${#RES_SECRETS[@]} == 0)); then
-    echo
-    echo "(No matching secret names found.)"
-    NAV_SIGNAL=""
-    return 0
+    echo; echo "(No matching secret names found.)"; NAV_SIGNAL=""; return 0
   fi
 
-  # Selector over results (numbered)
   while true; do
-    echo
-    echo "Open a result by number, or:"
+    echo; echo "Open a result by number, or:"
     echo "  r) New search"
     echo "  b) Back to Vaults"
     echo "  q) Main Menu"
@@ -549,28 +485,18 @@ cross_vault_search() {
         if [[ "$choice" =~ ^[0-9]+$ ]]; then
           local sel=$((choice-1))
           if (( sel >= 0 && sel < ${#RES_SECRETS[@]} )); then
-            local v="${RES_VAULTS[$sel]}"
-            local s="${RES_SECRETS[$sel]}"
-            # Build filtered view for this vault to enable next/prev
+            local v="${RES_VAULTS[$sel]}"; local s="${RES_SECRETS[$sel]}"
             log_cmd az keyvault secret list --vault-name "$v" --query "[].name" -o tsv
             if az keyvault secret list --vault-name "$v" --query "[].name" -o tsv > "$TMP_DIR/view.tsv" 2>>"$LOG_FILE"; then
               mapfile -t VIEW_NAMES < <(grep -iF -- "$filter_substr" "$TMP_DIR/view.tsv" || true)
               local start_idx=-1
-              for ((i=0;i<${#VIEW_NAMES[@]};i++)); do
-                if [[ "${VIEW_NAMES[$i]}" == "$s" ]]; then start_idx=$i; break; fi
-              done
-              if (( start_idx == -1 )); then
-                err "Selected secret not found in filtered view; refreshing search."
-                continue
-              fi
+              for ((i=0;i<${#VIEW_NAMES[@]};i++)); do [[ "${VIEW_NAMES[$i]}" == "$s" ]] && { start_idx=$i; break; }; done
+              if (( start_idx == -1 )); then err "Selected secret not found in filtered view; refreshing search."; continue; fi
               secret_detail_loop "$v" "$start_idx" VIEW_NAMES || true
               if [[ "$NAV_SIGNAL" == "MAIN" || "$NAV_SIGNAL" == "VAULTS" ]]; then return 0; fi
-              NAV_SIGNAL=""
-              continue
+              NAV_SIGNAL=""; continue
             else
-              err "Failed to rebuild filtered view for $v"
-              say "Failed to open selection (see log)."
-              continue
+              err "Failed to rebuild filtered view for $v"; say "Failed to open selection (see log)."; continue
             fi
           else
             say "Invalid selection."
@@ -589,29 +515,23 @@ search_and_print_secret_values() {
   [[ -z "$filter_substr" ]] && { say "Empty filter; cancelled."; return 0; }
   log "SEARCH_VALUES_FILTER: substr:${filter_substr}"
 
-  # Get vaults
   local VAULTS_ALL=()
   log_cmd az keyvault list --query "[].name" -o tsv
   if ! az keyvault list --query "[].name" -o tsv > "$TMP_DIR/vaults.tsv" 2>>"$LOG_FILE"; then
-    err "Failed to list vaults for value search"
-    say "Failed to list vaults (see log)."
-    return 1
+    err "Failed to list vaults for value search"; say "Failed to list vaults (see log)."; return 1
   fi
   mapfile -t VAULTS_ALL < "$TMP_DIR/vaults.tsv"
   (( ${#VAULTS_ALL[@]} == 0 )) && { say "No Key Vaults found."; return 0; }
 
   local total_hits=0
-  echo
-  echo "=== Matching secrets (with VALUES) for \"$filter_substr\" ==="
+  echo; echo "=== Matching secrets (with VALUES) for \"$filter_substr\" ==="
   for v in "${VAULTS_ALL[@]}"; do
     log_cmd az keyvault secret list --vault-name "$v" --query "[].name" -o tsv
     if az keyvault secret list --vault-name "$v" --query "[].name" -o tsv > "$TMP_DIR/names.tsv" 2>>"$LOG_FILE"; then
       mapfile -t HITS < <(grep -iF -- "$filter_substr" "$TMP_DIR/names.tsv" || true)
       if ((${#HITS[@]} > 0)); then
-        echo
-        echo "Vault: $v"
+        echo; echo "Vault: $v"
         for nm in "${HITS[@]}"; do
-          # Fetch value (print to terminal; do not log unless LOG_SECRET_VALUES=true)
           log_cmd az keyvault secret show --vault-name "$v" --name "$nm" --query value -o tsv
           if az keyvault secret show --vault-name "$v" --name "$nm" --query 'value' -o tsv > "$TMP_DIR/val.txt" 2>>"$LOG_FILE"; then
             val="$(cat "$TMP_DIR/val.txt")"
@@ -620,8 +540,7 @@ search_and_print_secret_values() {
             [[ "$LOG_SECRET_VALUES" == "true" ]] && log "SECRET_VALUE: vault:${v} secret:${nm} value:${val}"
             total_hits=$((total_hits+1))
           else
-            err "Failed to fetch value for ${nm} in ${v}"
-            echo "  ${nm} = <FAILED TO READ>"
+            err "Failed to fetch value for ${nm} in ${v}"; echo "  ${nm} = <FAILED TO READ>"
           fi
         done
       fi
@@ -630,37 +549,26 @@ search_and_print_secret_values() {
     fi
   done
 
-  if (( total_hits == 0 )); then
-    echo
-    echo "(No matching secret names found.)"
-  else
-    echo
-    echo "Total matching secrets printed: ${total_hits}"
-  fi
+  if (( total_hits == 0 )); then echo; echo "(No matching secret names found.)"
+  else echo; echo "Total matching secrets printed: ${total_hits}"; fi
 }
 
 # -------- List all vaults and secret NAMES (no values) --------
 list_all_vaults_and_secret_names() {
   log_cmd az keyvault list --query "[].name" -o tsv
   if ! az keyvault list --query "[].name" -o tsv > "$TMP_DIR/vaults.tsv" 2>>"$LOG_FILE"; then
-    err "Failed to list vaults"
-    say "Failed to list vaults (see log)."
-    return 1
+    err "Failed to list vaults"; say "Failed to list vaults (see log)."; return 1
   fi
   mapfile -t VAULTS_ALL < "$TMP_DIR/vaults.tsv"
   (( ${#VAULTS_ALL[@]} == 0 )) && { say "No Key Vaults found."; return 0; }
 
   for v in "${VAULTS_ALL[@]}"; do
-    echo
-    echo "=== Vault: $v ==="
+    echo; echo "=== Vault: $v ==="
     log_cmd az keyvault secret list --vault-name "$v" --query "[].{Name:name}" -o table
     az keyvault secret list --vault-name "$v" --query "[].{Name:name}" -o table 2>>"$LOG_FILE" | tee -a "$LOG_FILE" >/dev/stderr
     log_cmd az keyvault secret list --vault-name "$v" --query "[].name" -o tsv
     if az keyvault secret list --vault-name "$v" --query "[].name" -o tsv > "$TMP_DIR/names.tsv" 2>>"$LOG_FILE"; then
-      while IFS= read -r nm; do
-        [[ -z "$nm" ]] && continue
-        log "ENUM: vault:${v} secret_name:${nm}"
-      done < "$TMP_DIR/names.tsv"
+      while IFS= read -r nm; do [[ -z "$nm" ]] && continue; log "ENUM: vault:${v} secret_name:${nm}"; done < "$TMP_DIR/names.tsv"
     fi
   done
 }
@@ -678,25 +586,23 @@ main_menu() {
     echo "  6) Show ALL vaults and their secret NAMES (no values)"
     echo "  7) Search across ALL vaults for secret NAMES matching a string and PRINT their VALUES"
     echo "  8) Exit"
-    echo "  9) Capture NEXT action output to a TXT file"
+    if [[ "$CAPTURE_NEXT" == "true" ]]; then
+      echo "  9) Disable capture for NEXT action  (currently: ENABLED -> file: $CAPTURE_FILE)"
+    else
+      echo "  9) Capture NEXT action output to a TXT file  (currently: DISABLED)"
+    fi
     read -r -p "Choose 1-9: " m
     case "$m" in
       1) run_with_optional_capture sp_login_interactive ;;
       2) run_with_optional_capture choose_subscription ;;
       3)
-        if ! already_logged_in; then
-          say "Please login first."
-        else
-          run_with_optional_capture vault_browser
-        fi
+        if ! already_logged_in; then say "Please login first."
+        else run_with_optional_capture vault_browser; fi
         ;;
       4)
         if [[ "$CAPTURE_NEXT" == "true" ]]; then begin_capture; fi
-        echo "----- $LOG_FILE -----"
-        tail -n 200 "$LOG_FILE" || true
-        echo
-        echo "----- $READPASS_LOG -----"
-        tail -n 200 "$READPASS_LOG" || true
+        echo "----- $LOG_FILE -----"; tail -n 200 "$LOG_FILE" || true
+        echo; echo "----- $READPASS_LOG -----"; tail -n 200 "$READPASS_LOG" || true
         if [[ "$CAPTURE_NEXT" == "true" ]]; then end_capture; fi
         ;;
       5)
@@ -705,16 +611,15 @@ main_menu() {
         ;;
       6) run_with_optional_capture list_all_vaults_and_secret_names ;;
       7) run_with_optional_capture search_and_print_secret_values ;;
-      8)
-        log "Exiting."
-        break
-        ;;
+      8) log "Exiting."; break ;;
       9)
-        enable_capture_next
+        if [[ "$CAPTURE_NEXT" == "true" ]]; then
+          disable_capture_next
+        else
+          enable_capture_next
+        fi
         ;;
-      *)
-        say "Invalid option"
-        ;;
+      *) say "Invalid option" ;;
     esac
   done
 }
