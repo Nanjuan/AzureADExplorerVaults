@@ -3,4 +3,4 @@
 - [ ] Another option that will show all the vaults and the secrets name on each vaults and is display on the screen for options all at once. 
 - [ ] anotehr values that will show all the vaults and the secrests with a specific query added to it if the secrests name have the parameter pass by the user from a option. 
 - [ ] after I looked at a secrets do not go all the way back to the main menu go back to the secrests table name and have the option to go back or to view the next secret. 
-- [ ] for the loging file change the name to so it follow the {date}.{time}.{name of the logfile}
+- [x] for the loging file change the name to so it follow the {date}.{time}.{name of the logfile}
