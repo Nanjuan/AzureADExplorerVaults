@@ -14,3 +14,8 @@
 - [x] Add a feature that will allow me to disabled the output file from option 9 if I set it up. Also have a terminal field that show option 9 is enable when is enable and disable when is disable. 
 - [x] Fix the output file. 
 - [x] Fix output so it does not safe any of the Main Menu from the terminal. 
+- [x] Modify so it does not auto log out but it check if the user you enter is already log in into the machine or not if is log in then just used that log in session if is not it will log in with the credentials I privided during the SP login. 
+- [ ] add a feature that allow another account to be added a extra account on the option 2) choose subcription. this will list all the subcription I am log in as and allow me to select different account. 
+- [ ] Confirm that every time i selct manu 1 it will just add a new credentials to the list of authenticated credentials. 
+- [ ] add a feature on 5) logout to list the users I am log in and allow me to logout the ones I selected. 
+

@@ -106,10 +106,11 @@ run_az() {
 
 already_logged_in() { az account show >/dev/null 2>&1; }
 
+# Manual logout still available (not used automatically)
 logout_if_logged_in() {
   if already_logged_in; then
-    log "Existing az session detected. Logging out first."
-    say "Logging out existing Azure session..."
+    log "Manual logout requested."
+    say "Logging out Azure session..."
     run_az "az logout" -- az logout || true
   fi
 }
@@ -136,12 +137,61 @@ capture_disable() {
 }
 
 # Run a function with capture if enabled (captures both stdout and stderr).
-# IMPORTANT: Uses brace group { ...; } to avoid subshell, so state changes persist.
+# Uses a brace group { ...; } to avoid subshell, so state changes persist.
 run_maybe_capture() {
   if [[ "$CAPTURE_ENABLED" == "true" ]]; then
     { "$@"; } > >(tee -a "$CAPTURE_FILE") 2> >(tee -a "$CAPTURE_FILE" >&2)
   else
     "$@"
+  fi
+}
+
+# ---- Helper: try to reuse an existing SP session for the given AppID ----
+reuse_or_login_sp() {
+  # Args: SP_APPID SP_PASS SP_TENANT
+  local SP_APPID="$1"; local SP_PASS="$2"; local SP_TENANT="$3"
+
+  # 1) Check if ANY account in the machine sessions matches this SP (no jq needed)
+  #    If found, set that subscription active and reuse.
+  local existing_sub_id=""
+  existing_sub_id="$(az account list --all \
+    --query "[?user.type=='servicePrincipal' && user.name=='${SP_APPID}'].id | [0]" -o tsv 2>/dev/null || true)"
+
+  if [[ -n "$existing_sub_id" ]]; then
+    log "Found existing SP session for appId ${SP_APPID}; reusing (subscription ${existing_sub_id})."
+    say "Reusing existing Service Principal session (subscription: ${existing_sub_id})"
+    if ! run_az "az account set ${existing_sub_id}" -- az account set --subscription "$existing_sub_id"; then
+      say "Warning: failed to set subscription to existing SP session; proceeding anyway."
+    fi
+    CURRENT_LOGIN="$SP_APPID"
+    return 0
+  fi
+
+  # 2) Fallback: if current active account is already this SP, reuse it.
+  local cur_name cur_type
+  cur_name="$(az account show --query user.name -o tsv 2>/dev/null || true)"
+  cur_type="$(az account show --query user.type -o tsv 2>/dev/null || true)"
+  if [[ "$cur_type" == "servicePrincipal" && "$cur_name" == "$SP_APPID" ]]; then
+    log "Active account already matches SP ${SP_APPID}; reusing."
+    say "Reusing current active Service Principal session."
+    CURRENT_LOGIN="$SP_APPID"
+    return 0
+  fi
+
+  # 3) Not found → perform login (NO automatic logout)
+  log "Attempting SP login for appId $SP_APPID (tenant $SP_TENANT)"
+  say "Logging in..."
+  if run_az "az login (SP)" -- az login --service-principal \
+        --username "$SP_APPID" --password "$SP_PASS" --tenant "$SP_TENANT"
+  then
+    CURRENT_LOGIN="$SP_APPID"
+    log "SP login succeeded for $SP_APPID"
+    say "Login successful as $SP_APPID"
+    return 0
+  else
+    err "SP login failed for $SP_APPID"
+    say "Login failed — check $LOG_FILE for details."
+    return 1
   fi
 }
 
@@ -167,20 +217,8 @@ sp_login_interactive() {
     read -r -p "Tenant ID (or domain): " SP_TENANT
   fi
 
-  logout_if_logged_in
-
-  log "Attempting SP login for appId $SP_APPID (tenant $SP_TENANT)"
-  say "Logging in..."
-  if run_az "az login (SP)" -- az login --service-principal \
-        --username "$SP_APPID" --password "$SP_PASS" --tenant "$SP_TENANT"
-  then
-    CURRENT_LOGIN="$SP_APPID"
-    log "SP login succeeded for $SP_APPID"
-    say "Login successful as $SP_APPID"
-  else
-    err "SP login failed for $SP_APPID"
-    say "Login failed — check $LOG_FILE for details."
-  fi
+  # IMPORTANT: Do NOT auto-logout. Reuse if present, else login.
+  reuse_or_login_sp "$SP_APPID" "$SP_PASS" "$SP_TENANT"
 }
 
 # ---------------- Subscription selection ----------------
@@ -558,7 +596,6 @@ main_menu() {
         else run_maybe_capture vault_browser; fi
         ;;
       4)
-        # Viewing logs is itself a function; capture will include the displayed logs if enabled
         run_maybe_capture bash -c 'echo "----- '"$LOG_FILE"' -----"; tail -n 200 "'"$LOG_FILE"'" || true; echo; echo "----- '"$READPASS_LOG"' -----"; tail -n 200 "'"$READPASS_LOG"'" || true'
         ;;
       5)
