@@ -29,9 +29,12 @@ LOG_SECRET_VALUES="${LOG_SECRET_VALUES:-false}"
 # Timeout for az calls (seconds). Override with: export AZ_CMD_TIMEOUT_SECONDS=45
 AZ_CMD_TIMEOUT_SECONDS="${AZ_CMD_TIMEOUT_SECONDS:-30}"
 
+# Track who we're logged in as (shown on every log line)
+CURRENT_LOGIN="unset"
+
 timestamp(){ date +"%Y-%m-%d %H:%M:%S"; }
-log(){ echo "$(timestamp) - $*" | tee -a "$LOG_FILE"; }
-err(){ echo "$(timestamp) - ERROR - $*" | tee -a "$LOG_FILE" >&2; }
+log(){ echo "$(timestamp) - user:${CURRENT_LOGIN} - $*" | tee -a "$LOG_FILE"; }
+err(){ echo "$(timestamp) - user:${CURRENT_LOGIN} - ERROR - $*" | tee -a "$LOG_FILE" >&2; }
 say(){ echo "[ $(timestamp) ] $*" >&2; }
 
 run_az() {
@@ -96,6 +99,7 @@ sp_login_interactive() {
         --password "$SP_PASS" \
         --tenant   "$SP_TENANT"
   then
+    CURRENT_LOGIN="$SP_APPID"
     log "SP login succeeded for $SP_APPID"
     say "Logged in as SP: $SP_APPID"
     say "Account summary:"
@@ -120,6 +124,7 @@ login_with_secret_value_as_user() {
   say "Running az login for $try_user ..."
   if run_az "az login (target $try_user)" -- az login -u "$try_user" -p "$secret_value"
   then
+    CURRENT_LOGIN="$try_user"
     log "Login succeeded for $try_user"
     say "Login succeeded for $try_user"
     say "Current account:"
@@ -269,6 +274,11 @@ select_secret_in_vault() {
     return 1
   fi
 
+  # NEW: log each enumerated secret name with vault and user
+  for s in "${SECRET_NAMES[@]}"; do
+    log "ENUM: vault:${vault} secret_name:${s}"
+  done
+
   echo
   echo "Select a secret by number to fetch its VALUE, or choose:"
   echo "  a) Fetch ALL values (display only; high risk)"
@@ -369,7 +379,7 @@ inspect_secret_and_maybe_login() {
   esac
 }
 
-# -------- NEW: List all vaults and secret NAMES (no values) --------
+# -------- List all vaults and secret NAMES (no values) --------
 list_all_vaults_and_secret_names() {
   if ! already_logged_in; then
     err "Please login first."
@@ -402,10 +412,19 @@ list_all_vaults_and_secret_names() {
   for v in "${VAULTS_ALL[@]}"; do
     echo
     echo "=== Vault: $v ==="
-    # Show secret names ONLY as a table and also log it
+    # Screen: secret names table (no values)
     if ! az keyvault secret list --vault-name "$v" --query "[].{Name:name}" -o table 2>>"$LOG_FILE" | tee -a "$LOG_FILE"; then
       echo "(failed to list secrets for $v)"
       log "Failed to list secrets (names) for $v"
+      continue
+    fi
+
+    # Log: one line per secret with vault name
+    if az keyvault secret list --vault-name "$v" --query "[].name" -o tsv > "$TMP_DIR/names.tsv" 2>>"$LOG_FILE"; then
+      while IFS= read -r nm; do
+        [[ -z "$nm" ]] && continue
+        log "ENUM: vault:${v} secret_name:${nm}"
+      done < "$TMP_DIR/names.tsv"
     fi
   done
 

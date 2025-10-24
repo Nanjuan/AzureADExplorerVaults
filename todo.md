@@ -1,5 +1,5 @@
 - [x] Make sure the app check if you are already log in and log out before trying to log in again. - Done 
-- [ ] When you enumnerate the keyvault on the log file name sure you add at the beggining of that section the az login uuser that is login and doing the query based on the suceess login. 
+- [x] When you enumnerate the keyvault on the log file add the name of the keyvault to each secret name when adding it to the logs also add the user used to log in as the top of the line for the logs.
 - [x] Another option that will show all the vaults and the secrets name on each vaults and is display on the screen for options all at once. 
 - [ ] anotehr values that will show all the vaults and the secrests with a specific query added to it if the secrests name have the parameter pass by the user from a option. 
 - [ ] after I looked at a secrets do not go all the way back to the main menu go back to the secrests table name and have the option to go back or to view the next secret. 
