@@ -142,7 +142,6 @@ choose_subscription() {
   fi
 
   if ! command -v jq >/dev/null 2>&1; then
-    # No jq; show table then prompt for ID
     say "jq not found; showing table output."
     log_cmd az account list --output table
     az account list --output table 2>>"$LOG_FILE"
@@ -359,7 +358,7 @@ secret_detail_loop() {
   done
 }
 
-# -------- Cross-vault secret name search (by substring) --------
+# -------- Cross-vault secret name search (by substring, names only) --------
 cross_vault_search() {
   read -r -p "Enter substring to find in secret names (case-insensitive): " filter_substr
   [[ -z "$filter_substr" ]] && { say "Empty filter; cancelled."; NAV_SIGNAL=""; return 0; }
@@ -390,7 +389,7 @@ cross_vault_search() {
 
   (( ${#VAULTS_ALL[@]} == 0 )) && { say "No Key Vaults found."; NAV_SIGNAL=""; return 0; }
 
-  # Aggregate and display hits
+  # Aggregate and display hits (names only)
   local RES_VAULTS=()
   local RES_SECRETS=()
 
@@ -475,6 +474,62 @@ cross_vault_search() {
   done
 }
 
+# -------- NEW: Cross-vault search (names match substring) and PRINT VALUES --------
+search_and_print_secret_values() {
+  read -r -p "Enter substring to find in secret names (case-insensitive, will PRINT VALUES): " filter_substr
+  [[ -z "$filter_substr" ]] && { say "Empty filter; cancelled."; return 0; }
+  log "SEARCH_VALUES_FILTER: substr:${filter_substr}"
+
+  # Get vaults
+  local VAULTS_ALL=()
+  log_cmd az keyvault list --query "[].name" -o tsv
+  if ! az keyvault list --query "[].name" -o tsv > "$TMP_DIR/vaults.tsv" 2>>"$LOG_FILE"; then
+    err "Failed to list vaults for value search"
+    say "Failed to list vaults (see log)."
+    return 1
+  fi
+  mapfile -t VAULTS_ALL < "$TMP_DIR/vaults.tsv"
+  (( ${#VAULTS_ALL[@]} == 0 )) && { say "No Key Vaults found."; return 0; }
+
+  local total_hits=0
+  echo
+  echo "=== Matching secrets (with VALUES) for \"$filter_substr\" ==="
+  for v in "${VAULTS_ALL[@]}"; do
+    log_cmd az keyvault secret list --vault-name "$v" --query "[].name" -o tsv
+    if az keyvault secret list --vault-name "$v" --query "[].name" -o tsv > "$TMP_DIR/names.tsv" 2>>"$LOG_FILE"; then
+      mapfile -t HITS < <(grep -iF -- "$filter_substr" "$TMP_DIR/names.tsv" || true)
+      (( ${#HITS[@]} == 0 )) && continue
+
+      echo
+      echo "Vault: $v"
+      for nm in "${HITS[@]}"; do
+        # Fetch value (print to terminal; do not log unless LOG_SECRET_VALUES=true)
+        log_cmd az keyvault secret show --vault-name "$v" --name "$nm" --query value -o tsv
+        if az keyvault secret show --vault-name "$v" --name "$nm" --query 'value' -o tsv > "$TMP_DIR/val.txt" 2>>"$LOG_FILE"; then
+          val="$(cat "$TMP_DIR/val.txt")"
+          echo "  ${nm} = ${val}"
+          log "FETCHED_VALUE: vault:${v} secret_name:${nm} (printed to terminal)"
+          [[ "$LOG_SECRET_VALUES" == "true" ]] && log "SECRET_VALUE: vault:${v} secret:${nm} value:${val}"
+          total_hits=$((total_hits+1))
+        else
+          err "Failed to fetch value for ${nm} in ${v}"
+          echo "  ${nm} = <FAILED TO READ>"
+        fi
+      done
+    else
+      log "Failed to list secrets for vault ${v} during value search"
+    fi
+  done
+
+  if (( total_hits == 0 )); then
+    echo
+    echo "(No matching secret names found.)"
+  else
+    echo
+    echo "Total matching secrets printed: ${total_hits}"
+  fi
+}
+
 # -------- List all vaults and secret NAMES (no values) --------
 list_all_vaults_and_secret_names() {
   log_cmd az keyvault list --query "[].name" -o tsv
@@ -490,9 +545,7 @@ list_all_vaults_and_secret_names() {
     echo
     echo "=== Vault: $v ==="
     log_cmd az keyvault secret list --vault-name "$v" --query "[].{Name:name}" -o table
-    # Mirror secret names table to terminal and log (table output only; no timestamps)
     az keyvault secret list --vault-name "$v" --query "[].{Name:name}" -o table 2>>"$LOG_FILE" | tee -a "$LOG_FILE" >/dev/stderr
-    # Also record enumeration lines in log
     log_cmd az keyvault secret list --vault-name "$v" --query "[].name" -o tsv
     if az keyvault secret list --vault-name "$v" --query "[].name" -o tsv > "$TMP_DIR/names.tsv" 2>>"$LOG_FILE"; then
       while IFS= read -r nm; do
@@ -514,8 +567,9 @@ main_menu() {
     echo "  4) Show logs (last 200 lines)"
     echo "  5) Logout (if logged in)"
     echo "  6) Show ALL vaults and their secret NAMES (no values)"
-    echo "  7) Exit"
-    read -r -p "Choose 1-7: " m
+    echo "  7) Search across ALL vaults for secret NAMES matching a string and PRINT their VALUES"
+    echo "  8) Exit"
+    read -r -p "Choose 1-8: " m
     case "$m" in
       1) sp_login_interactive ;;
       2) choose_subscription ;;
@@ -527,7 +581,6 @@ main_menu() {
         fi
         ;;
       4)
-        # User explicitly asked to see logs — okay to show timestamps here
         echo "----- $LOG_FILE -----"
         tail -n 200 "$LOG_FILE" || true
         echo
@@ -547,6 +600,9 @@ main_menu() {
         list_all_vaults_and_secret_names
         ;;
       7)
+        search_and_print_secret_values
+        ;;
+      8)
         log "Exiting."
         break
         ;;
