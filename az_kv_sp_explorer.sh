@@ -2,6 +2,20 @@
 # az_kv_sp_explorer.sh
 # Login as SP, list vaults, search across vaults, browse secrets, fetch values on demand.
 # Terminal output is clean (no timestamps). Logs contain timestamps and command traces.
+#
+# Optional config file:
+#   Path (default): ./az_kv_sp_explorer.conf
+#   Format: simple KEY=VALUE lines (no quotes needed). Supported keys:
+#     TENANT_ID=00000000-0000-0000-0000-000000000000
+#     DEFAULT_SUBSCRIPTION_ID=<sub-id>          # (not auto-used; for future use)
+#     LOG_SECRET_VALUES=false                   # true|false (default false)
+#     AZ_CMD_TIMEOUT_SECONDS=30                 # integer seconds
+#
+# Example:
+#   # az_kv_sp_explorer.conf
+#   TENANT_ID=11111111-2222-3333-4444-555555555555
+#   LOG_SECRET_VALUES=false
+#   AZ_CMD_TIMEOUT_SECONDS=45
 
 set -o errexit
 set -o nounset
@@ -22,9 +36,12 @@ TMP_DIR="/tmp/az_kv_sp_explorer.$$"
 mkdir -p "$TMP_DIR"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-# Settings
+# Settings (may be overridden by config)
 LOG_SECRET_VALUES="${LOG_SECRET_VALUES:-false}"         # set true to also log secret values (not recommended)
 AZ_CMD_TIMEOUT_SECONDS="${AZ_CMD_TIMEOUT_SECONDS:-30}"  # wrap az calls in timeout
+
+# Config path
+CONFIG_FILE="${CONFIG_FILE:-./az_kv_sp_explorer.conf}"
 
 # State
 CURRENT_LOGIN="unset"
@@ -44,14 +61,35 @@ timestamp(){ date +"%Y-%m-%d %H:%M:%S"; }
 # Log to file with timestamp; no terminal echo here
 log(){ echo "$(timestamp) - user:${CURRENT_LOGIN} - $*" >>"$LOG_FILE"; }
 err(){ echo "$(timestamp) - user:${CURRENT_LOGIN} - ERROR - $*" >>"$LOG_FILE"; }
-
 # Clean terminal output (no timestamps). While capturing, also mirror to stdout.
 say(){
-  if [[ "$CAPTURE_ACTIVE" == "true" ]]; then
-    # mirror to captured stdout AND keep stderr output for prompts
+  if [[ "${CAPTURE_ACTIVE}" == "true" ]]; then
     echo "$*"
   fi
   echo "$*" >&2
+}
+
+# ----- Load config (safe parser for KEY=VALUE lines) -----
+TENANT_ID_CFG="${TENANT_ID_CFG:-}"
+DEFAULT_SUBSCRIPTION_ID_CFG="${DEFAULT_SUBSCRIPTION_ID_CFG:-}"
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # Only parse simple KEY=VALUE (no spaces around =). Ignore comments/blank lines.
+    while IFS='=' read -r key val; do
+      # Trim leading/trailing whitespace
+      key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+      val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+      [[ -z "$key" || "$key" =~ ^# ]] && continue
+      case "$key" in
+        TENANT_ID) TENANT_ID_CFG="$val" ;;
+        DEFAULT_SUBSCRIPTION_ID) DEFAULT_SUBSCRIPTION_ID_CFG="$val" ;;
+        LOG_SECRET_VALUES) LOG_SECRET_VALUES="$val" ;;
+        AZ_CMD_TIMEOUT_SECONDS) AZ_CMD_TIMEOUT_SECONDS="$val" ;;
+        *) : ;; # ignore unknown keys
+      esac
+    done < "$CONFIG_FILE"
+    log "Loaded config from $CONFIG_FILE (TENANT_ID present: $([[ -n "$TENANT_ID_CFG" ]] && echo yes || echo no))"
+  fi
 }
 
 # Log commands with safe redaction (don’t leak secrets in logs)
@@ -126,14 +164,12 @@ enable_capture_next() {
     CAPTURE_NEXT="false"
     return 0
   fi
-  # Ensure path is writable and truncate file
   : > "$CAPTURE_FILE" || { say "Cannot write to $CAPTURE_FILE"; CAPTURE_NEXT="false"; return 1; }
   CAPTURE_NEXT="true"
   say "Capture ENABLED for the NEXT menu action → $CAPTURE_FILE"
 }
 
 begin_capture() {
-  # Save current stdout (FD 1) and redirect stdout to tee
   CAPTURE_ACTIVE="true"
   # shellcheck disable=SC3028
   exec {CAPTURE_FD}>&1
@@ -141,7 +177,6 @@ begin_capture() {
 }
 
 end_capture() {
-  # Restore stdout from saved FD and close it
   # shellcheck disable=SC3030
   exec 1>&$CAPTURE_FD
   # shellcheck disable=SC3028
@@ -170,7 +205,22 @@ sp_login_interactive() {
   echo "Service Principal login (interactive)."
   read -r -p "Service Principal AppID (username): " SP_APPID
   read -r -s -p "Service Principal Password: " SP_PASS ; echo
-  read -r -p "Tenant ID (or domain): " SP_TENANT
+
+  # Load config and handle Tenant ID prompt/use
+  load_config
+  local SP_TENANT=""
+  if [[ -n "${TENANT_ID_CFG:-}" ]]; then
+    echo "Config file detected at: $CONFIG_FILE"
+    echo "TENANT_ID in config: $TENANT_ID_CFG"
+    read -r -p "Use TENANT_ID from config? [Y/n]: " use_cfg
+    if [[ -z "$use_cfg" || "$use_cfg" =~ ^[Yy]$ ]]; then
+      SP_TENANT="$TENANT_ID_CFG"
+    else
+      read -r -p "Tenant ID (or domain): " SP_TENANT
+    fi
+  else
+    read -r -p "Tenant ID (or domain): " SP_TENANT
+  fi
 
   logout_if_logged_in
 
@@ -487,7 +537,7 @@ cross_vault_search() {
     echo "  r) New search"
     echo "  b) Back to Vaults"
     echo "  q) Main Menu"
-    for ((k=0; k<${#RES_SECRETS[@]}:; k++)); do
+    for ((k=0; k<${#RES_SECRETS[@]}; k++)); do
       printf "%3d) %s :: %s\n" $((k+1)) "${RES_VAULTS[$k]}" "${RES_SECRETS[$k]}"
     done
     read -r -p "Your choice: " choice
@@ -533,7 +583,7 @@ cross_vault_search() {
   done
 }
 
-# -------- NEW: Cross-vault search (names match substring) and PRINT VALUES --------
+# -------- Cross-vault search (names match substring) and PRINT VALUES --------
 search_and_print_secret_values() {
   read -r -p "Enter substring to find in secret names (case-insensitive, will PRINT VALUES): " filter_substr
   [[ -z "$filter_substr" ]] && { say "Empty filter; cancelled."; return 0; }
@@ -641,7 +691,6 @@ main_menu() {
         fi
         ;;
       4)
-        # Showing logs: capture if enabled
         if [[ "$CAPTURE_NEXT" == "true" ]]; then begin_capture; fi
         echo "----- $LOG_FILE -----"
         tail -n 200 "$LOG_FILE" || true

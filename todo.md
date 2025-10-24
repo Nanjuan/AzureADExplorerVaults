@@ -5,7 +5,7 @@
 - [x] after I looked at a secrets do not go all the way back to the main menu go back to the secrests table name and have the option to go back or to view the next secret. 
 - [x] For the loging file change the name to so it follow the {date}.{time}.{name of the logfile}
 - [x] Modify so the logs show what commands was run for each section and option selected so that get log also to the logs files. 
-- [ ] Add the funtionality that there will be a config file that has the tenant id and when loggin in it will check for the config file and if is there it will ask the user do you want to used the tenant id on the file or enter a new one. 
+- [x] Add the funtionality that there will be a config file that has the tenant id and when loggin in it will check for the config file and if is there it will ask the user do you want to used the tenant id on the file or enter a new one. 
 - [x] Remove the option to log in when you see a secret. 
 - [x] Modify so the export all secrets on the terimnal it only display the vaults and secret name and not the lines with the date on the terminal. The date and time should only be on the log but not on the terminal. 
 - [x] Modify so all the lines with date that are used for logs are only on the logs and not showing on the terminal to make the terminal interaction more clean. 
