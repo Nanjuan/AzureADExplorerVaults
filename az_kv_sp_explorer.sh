@@ -33,13 +33,26 @@ CURRENT_LOGIN="unset"
 # "" = none, "MAIN" = return to Main Menu, "VAULTS" = return to vault list
 NAV_SIGNAL=""
 
+# Capture-next-action state
+CAPTURE_NEXT="false"
+CAPTURE_ACTIVE="false"
+CAPTURE_FILE=""
+CAPTURE_FD=""
+
 # ----- Logging helpers -----
 timestamp(){ date +"%Y-%m-%d %H:%M:%S"; }
 # Log to file with timestamp; no terminal echo here
 log(){ echo "$(timestamp) - user:${CURRENT_LOGIN} - $*" >>"$LOG_FILE"; }
 err(){ echo "$(timestamp) - user:${CURRENT_LOGIN} - ERROR - $*" >>"$LOG_FILE"; }
-# Clean terminal output (no timestamps)
-say(){ echo "$*" >&2; }
+
+# Clean terminal output (no timestamps). While capturing, also mirror to stdout.
+say(){
+  if [[ "$CAPTURE_ACTIVE" == "true" ]]; then
+    # mirror to captured stdout AND keep stderr output for prompts
+    echo "$*"
+  fi
+  echo "$*" >&2
+}
 
 # Log commands with safe redaction (don’t leak secrets in logs)
 log_cmd() {
@@ -102,6 +115,52 @@ logout_if_logged_in() {
     log "Existing az session detected. Logging out first."
     say "Logging out existing Azure session..."
     run_az "az logout" -- az logout || true
+  fi
+}
+
+# --------- Capture-next-action helpers ---------
+enable_capture_next() {
+  read -r -p "Enter TXT filename to capture the NEXT action output (will overwrite if exists): " CAPTURE_FILE
+  if [[ -z "${CAPTURE_FILE:-}" ]]; then
+    say "No file provided. Capture cancelled."
+    CAPTURE_NEXT="false"
+    return 0
+  fi
+  # Ensure path is writable and truncate file
+  : > "$CAPTURE_FILE" || { say "Cannot write to $CAPTURE_FILE"; CAPTURE_NEXT="false"; return 1; }
+  CAPTURE_NEXT="true"
+  say "Capture ENABLED for the NEXT menu action → $CAPTURE_FILE"
+}
+
+begin_capture() {
+  # Save current stdout (FD 1) and redirect stdout to tee
+  CAPTURE_ACTIVE="true"
+  # shellcheck disable=SC3028
+  exec {CAPTURE_FD}>&1
+  exec > >(tee -a "$CAPTURE_FILE")
+}
+
+end_capture() {
+  # Restore stdout from saved FD and close it
+  # shellcheck disable=SC3030
+  exec 1>&$CAPTURE_FD
+  # shellcheck disable=SC3028
+  exec {CAPTURE_FD}>&-
+  CAPTURE_ACTIVE="false"
+  CAPTURE_NEXT="false"
+  say "Output captured to $CAPTURE_FILE"
+}
+
+run_with_optional_capture() {
+  # usage: run_with_optional_capture <function> [args...]
+  if [[ "$CAPTURE_NEXT" == "true" ]]; then
+    begin_capture
+    "$@"
+    local rc=$?
+    end_capture
+    return $rc
+  else
+    "$@"
   fi
 }
 
@@ -428,7 +487,7 @@ cross_vault_search() {
     echo "  r) New search"
     echo "  b) Back to Vaults"
     echo "  q) Main Menu"
-    for ((k=0; k<${#RES_SECRETS[@]}; k++)); do
+    for ((k=0; k<${#RES_SECRETS[@]}:; k++)); do
       printf "%3d) %s :: %s\n" $((k+1)) "${RES_VAULTS[$k]}" "${RES_SECRETS[$k]}"
     done
     read -r -p "Your choice: " choice
@@ -498,24 +557,24 @@ search_and_print_secret_values() {
     log_cmd az keyvault secret list --vault-name "$v" --query "[].name" -o tsv
     if az keyvault secret list --vault-name "$v" --query "[].name" -o tsv > "$TMP_DIR/names.tsv" 2>>"$LOG_FILE"; then
       mapfile -t HITS < <(grep -iF -- "$filter_substr" "$TMP_DIR/names.tsv" || true)
-      (( ${#HITS[@]} == 0 )) && continue
-
-      echo
-      echo "Vault: $v"
-      for nm in "${HITS[@]}"; do
-        # Fetch value (print to terminal; do not log unless LOG_SECRET_VALUES=true)
-        log_cmd az keyvault secret show --vault-name "$v" --name "$nm" --query value -o tsv
-        if az keyvault secret show --vault-name "$v" --name "$nm" --query 'value' -o tsv > "$TMP_DIR/val.txt" 2>>"$LOG_FILE"; then
-          val="$(cat "$TMP_DIR/val.txt")"
-          echo "  ${nm} = ${val}"
-          log "FETCHED_VALUE: vault:${v} secret_name:${nm} (printed to terminal)"
-          [[ "$LOG_SECRET_VALUES" == "true" ]] && log "SECRET_VALUE: vault:${v} secret:${nm} value:${val}"
-          total_hits=$((total_hits+1))
-        else
-          err "Failed to fetch value for ${nm} in ${v}"
-          echo "  ${nm} = <FAILED TO READ>"
-        fi
-      done
+      if ((${#HITS[@]} > 0)); then
+        echo
+        echo "Vault: $v"
+        for nm in "${HITS[@]}"; do
+          # Fetch value (print to terminal; do not log unless LOG_SECRET_VALUES=true)
+          log_cmd az keyvault secret show --vault-name "$v" --name "$nm" --query value -o tsv
+          if az keyvault secret show --vault-name "$v" --name "$nm" --query 'value' -o tsv > "$TMP_DIR/val.txt" 2>>"$LOG_FILE"; then
+            val="$(cat "$TMP_DIR/val.txt")"
+            echo "  ${nm} = ${val}"
+            log "FETCHED_VALUE: vault:${v} secret_name:${nm} (printed to terminal)"
+            [[ "$LOG_SECRET_VALUES" == "true" ]] && log "SECRET_VALUE: vault:${v} secret:${nm} value:${val}"
+            total_hits=$((total_hits+1))
+          else
+            err "Failed to fetch value for ${nm} in ${v}"
+            echo "  ${nm} = <FAILED TO READ>"
+          fi
+        done
+      fi
     else
       log "Failed to list secrets for vault ${v} during value search"
     fi
@@ -569,42 +628,40 @@ main_menu() {
     echo "  6) Show ALL vaults and their secret NAMES (no values)"
     echo "  7) Search across ALL vaults for secret NAMES matching a string and PRINT their VALUES"
     echo "  8) Exit"
-    read -r -p "Choose 1-8: " m
+    echo "  9) Capture NEXT action output to a TXT file"
+    read -r -p "Choose 1-9: " m
     case "$m" in
-      1) sp_login_interactive ;;
-      2) choose_subscription ;;
+      1) run_with_optional_capture sp_login_interactive ;;
+      2) run_with_optional_capture choose_subscription ;;
       3)
         if ! already_logged_in; then
           say "Please login first."
         else
-          vault_browser
+          run_with_optional_capture vault_browser
         fi
         ;;
       4)
+        # Showing logs: capture if enabled
+        if [[ "$CAPTURE_NEXT" == "true" ]]; then begin_capture; fi
         echo "----- $LOG_FILE -----"
         tail -n 200 "$LOG_FILE" || true
         echo
         echo "----- $READPASS_LOG -----"
         tail -n 200 "$READPASS_LOG" || true
+        if [[ "$CAPTURE_NEXT" == "true" ]]; then end_capture; fi
         ;;
       5)
-        if already_logged_in; then
-          logout_if_logged_in
-          say "Logged out."
-          CURRENT_LOGIN="unset"
-        else
-          say "No active session."
-        fi
+        run_with_optional_capture logout_if_logged_in
+        if [[ "$CURRENT_LOGIN" != "unset" ]]; then CURRENT_LOGIN="unset"; fi
         ;;
-      6)
-        list_all_vaults_and_secret_names
-        ;;
-      7)
-        search_and_print_secret_values
-        ;;
+      6) run_with_optional_capture list_all_vaults_and_secret_names ;;
+      7) run_with_optional_capture search_and_print_secret_values ;;
       8)
         log "Exiting."
         break
+        ;;
+      9)
+        enable_capture_next
         ;;
       *)
         say "Invalid option"

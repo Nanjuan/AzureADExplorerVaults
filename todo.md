@@ -7,7 +7,7 @@
 - [x] Modify so the logs show what commands was run for each section and option selected so that get log also to the logs files. 
 - [ ] Add the funtionality that there will be a config file that has the tenant id and when loggin in it will check for the config file and if is there it will ask the user do you want to used the tenant id on the file or enter a new one. 
 - [x] Remove the option to log in when you see a secret. 
-- [ ] Modify so the export all secrets on the terimnal it only display the vaults and secret name and not the lines with the date on the terminal. The date and time should only be on the log but not on the terminal. 
+- [x] Modify so the export all secrets on the terimnal it only display the vaults and secret name and not the lines with the date on the terminal. The date and time should only be on the log but not on the terminal. 
 - [x] Modify so all the lines with date that are used for logs are only on the logs and not showing on the terminal to make the terminal interaction more clean. 
 - [x] Add a feature that will look inside all the vaults for secrests that contain a specific strings then print the content of the secrets that contain the specific strings. 
-- [ ] Add a feature that will allow me to enable output and for the next specific query it will output that to a txt file. 
+- [x] Add a feature that will allow me to enable output and for the next specific query/option i select and it will output that to a txt file. 
