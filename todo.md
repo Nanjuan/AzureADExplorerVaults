@@ -13,3 +13,4 @@
 - [x] Add a feature that will allow me to enable output and for the next specific query/option i select and it will output that to a txt file. 
 - [x] Add a feature that will allow me to disabled the output file from option 9 if I set it up. Also have a terminal field that show option 9 is enable when is enable and disable when is disable. 
 - [x] Fix the output file. 
+- [x] Fix output so it does not safe any of the Main Menu from the terminal. 

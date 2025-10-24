@@ -45,11 +45,9 @@ CONFIG_FILE="${CONFIG_FILE:-./az_kv_sp_explorer.conf}"
 CURRENT_LOGIN="unset"
 NAV_SIGNAL=""
 
-# ===== Persistent capture (session-wide) =====
-CAPTURE_ENABLED="false"   # when true, stdout & stderr are mirrored to CAPTURE_FILE
+# ===== Persistent capture (functions only; not Main Menu) =====
+CAPTURE_ENABLED="false"   # when true, function outputs are mirrored to CAPTURE_FILE (both stdout & stderr)
 CAPTURE_FILE=""           # target file
-CAPTURE_OUT_FD=""         # saved stdout FD
-CAPTURE_ERR_FD=""         # saved stderr FD
 
 timestamp(){ date +"%Y-%m-%d %H:%M:%S"; }
 # Log to file only (with timestamps)
@@ -116,30 +114,16 @@ logout_if_logged_in() {
   fi
 }
 
-# ===== Capture toggle helpers (persistent) =====
+# ===== Capture toggle helpers (functions-only capture) =====
 capture_enable() {
-  read -r -p "Enter TXT filename to capture ALL terminal output (append mode): " CAPTURE_FILE
+  read -r -p "Enter TXT filename to capture function outputs (append mode): " CAPTURE_FILE
   if [[ -z "${CAPTURE_FILE:-}" ]]; then
     say "No file provided. Capture not enabled."
     return 0
   fi
-  # Touch to verify write access; we APPEND to preserve history
   : >> "$CAPTURE_FILE" || { say "Cannot write to $CAPTURE_FILE"; CAPTURE_FILE=""; return 1; }
-
-  if [[ "$CAPTURE_ENABLED" == "true" ]]; then
-    say "Capture already enabled → $CAPTURE_FILE"
-    return 0
-  fi
-
   CAPTURE_ENABLED="true"
-  # Save current stdout/stderr and redirect both through tee (append)
-  # shellcheck disable=SC3028
-  exec {CAPTURE_OUT_FD}>&1
-  # shellcheck disable=SC3028
-  exec {CAPTURE_ERR_FD}>&2
-  exec > >(tee -a "$CAPTURE_FILE")
-  exec 2> >(tee -a "$CAPTURE_FILE" >&2)
-  say "Capture ENABLED (persistent) → $CAPTURE_FILE"
+  say "Capture ENABLED (functions only) → $CAPTURE_FILE"
 }
 
 capture_disable() {
@@ -147,17 +131,18 @@ capture_disable() {
     say "Capture is already disabled."
     return 0
   fi
-  # Restore stdout/stderr
-  # shellcheck disable=SC3030
-  exec 1>&$CAPTURE_OUT_FD
-  # shellcheck disable=SC3030
-  exec 2>&$CAPTURE_ERR_FD
-  # shellcheck disable=SC3028
-  exec {CAPTURE_OUT_FD}>&-
-  # shellcheck disable=SC3028
-  exec {CAPTURE_ERR_FD}>&-
   CAPTURE_ENABLED="false"
   say "Capture DISABLED."
+}
+
+# Run a function with capture if enabled (captures both stdout and stderr).
+# IMPORTANT: Uses brace group { ...; } to avoid subshell, so state changes persist.
+run_maybe_capture() {
+  if [[ "$CAPTURE_ENABLED" == "true" ]]; then
+    { "$@"; } > >(tee -a "$CAPTURE_FILE") 2> >(tee -a "$CAPTURE_FILE" >&2)
+  else
+    "$@"
+  fi
 }
 
 # ---------------- Login flow (Service Principal) ----------------
@@ -560,28 +545,28 @@ main_menu() {
     echo "  7) Search across ALL vaults for secret NAMES matching a string and PRINT their VALUES"
     echo "  8) Exit"
     if [[ "$CAPTURE_ENABLED" == "true" ]]; then
-      echo "  9) Disable persistent capture  (Capture: ON → $CAPTURE_FILE)"
+      echo "  9) Disable capture (functions only)  (Capture: ON → $CAPTURE_FILE)"
     else
-      echo "  9) Enable persistent capture to a TXT file  (Capture: OFF)"
+      echo "  9) Enable capture to TXT (functions only)  (Capture: OFF)"
     fi
     read -r -p "Choose 1-9: " m
     case "$m" in
-      1) sp_login_interactive ;;
-      2) choose_subscription ;;
+      1) run_maybe_capture sp_login_interactive ;;
+      2) run_maybe_capture choose_subscription ;;
       3)
         if ! already_logged_in; then say "Please login first."
-        else vault_browser; fi
+        else run_maybe_capture vault_browser; fi
         ;;
       4)
-        echo "----- $LOG_FILE -----"; tail -n 200 "$LOG_FILE" || true
-        echo; echo "----- $READPASS_LOG -----"; tail -n 200 "$READPASS_LOG" || true
+        # Viewing logs is itself a function; capture will include the displayed logs if enabled
+        run_maybe_capture bash -c 'echo "----- '"$LOG_FILE"' -----"; tail -n 200 "'"$LOG_FILE"'" || true; echo; echo "----- '"$READPASS_LOG"' -----"; tail -n 200 "'"$READPASS_LOG"'" || true'
         ;;
       5)
-        logout_if_logged_in
+        run_maybe_capture logout_if_logged_in
         if [[ "$CURRENT_LOGIN" != "unset" ]]; then CURRENT_LOGIN="unset"; fi
         ;;
-      6) list_all_vaults_and_secret_names ;;
-      7) search_and_print_secret_values ;;
+      6) run_maybe_capture list_all_vaults_and_secret_names ;;
+      7) run_maybe_capture search_and_print_secret_values ;;
       8) log "Exiting."; break ;;
       9)
         if [[ "$CAPTURE_ENABLED" == "true" ]]; then
