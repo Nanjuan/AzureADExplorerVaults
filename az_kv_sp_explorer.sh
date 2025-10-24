@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # az_kv_sp_explorer.sh
-# Login as SP, list vaults, show secrets as a table (with cross-vault search), fetch values on demand.
-# Logs to {date}.{time}.script.log (no secret values by default) and {date}.{time}.readPass.log (usernames only).
+# Login as SP, list vaults, show secrets (with cross-vault search), fetch values on demand.
+# Logs include timestamps; terminal output is clean (no timestamps).
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
-# --- Require Bash explicitly (avoid sh/dash issues) ---
 if [ -z "${BASH_VERSION:-}" ]; then
   echo "This script must be run with bash. Try: bash $0" >&2
   exit 1
@@ -22,24 +21,18 @@ TMP_DIR="/tmp/az_kv_sp_explorer.$$"
 mkdir -p "$TMP_DIR"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-# Do NOT log secret values by default. Override: export LOG_SECRET_VALUES=true
 LOG_SECRET_VALUES="${LOG_SECRET_VALUES:-false}"
-
-# Timeout for az calls (seconds). Override with: export AZ_CMD_TIMEOUT_SECONDS=45
 AZ_CMD_TIMEOUT_SECONDS="${AZ_CMD_TIMEOUT_SECONDS:-30}"
 
-# Track who we're logged in as (shown on every log line)
 CURRENT_LOGIN="unset"
-
-# Navigation signal so submenus can return to Main Menu without non-zero exit codes
 NAV_SIGNAL=""
 
 timestamp(){ date +"%Y-%m-%d %H:%M:%S"; }
-log(){ echo "$(timestamp) - user:${CURRENT_LOGIN} - $*" | tee -a "$LOG_FILE"; }
-err(){ echo "$(timestamp) - user:${CURRENT_LOGIN} - ERROR - $*" | tee -a "$LOG_FILE" >&2; }
-say(){ echo "[ $(timestamp) ] $*" >&2; }
+log(){ echo "$(timestamp) - user:${CURRENT_LOGIN} - $*" >>"$LOG_FILE"; }
+err(){ echo "$(timestamp) - user:${CURRENT_LOGIN} - ERROR - $*" >>"$LOG_FILE"; }
+say(){ echo "$*"; }
 
-# --- Log commands with safe redaction (passwords/client-secrets) ---
+# --- Log commands with safe redaction ---
 log_cmd() {
   local out=""; local redact_next=0
   for arg in "$@"; do
@@ -61,15 +54,15 @@ run_az() {
   say "${desc} ..."
   if command -v timeout >/dev/null 2>&1; then
     if timeout "${AZ_CMD_TIMEOUT_SECONDS}s" "$@" >>"$LOG_FILE" 2>&1; then
-      log "OK: ${desc}"; say "${desc} ... OK"; return 0
+      log "OK: ${desc}"; return 0
     else
-      log "FAIL/Timeout: ${desc}"; say "${desc} ... FAIL or TIMEOUT"; return 1
+      log "FAIL/Timeout: ${desc}"; return 1
     fi
   else
     if "$@" >>"$LOG_FILE" 2>&1; then
-      log "OK: ${desc}"; say "${desc} ... OK"; return 0
+      log "OK: ${desc}"; return 0
     else
-      log "FAIL: ${desc}"; say "${desc} ... FAIL"; return 1
+      log "FAIL: ${desc}"; return 1
     fi
   fi
 }
@@ -84,156 +77,116 @@ logout_if_logged_in() {
   fi
 }
 
-# ---------------- Login flows ----------------
-
+# ---------------- Login flow ----------------
 sp_login_interactive() {
   echo
-  echo "Service Principal login (interactive). Enter values below."
+  echo "Service Principal login (interactive)."
   read -r -p "Service Principal AppID (username): " SP_APPID
-  read -r -s -p "Service Principal Password (password): " SP_PASS ; echo
+  read -r -s -p "Service Principal Password: " SP_PASS ; echo
   read -r -p "Tenant ID (or domain): " SP_TENANT
 
-  say "Checking current az session..."
   logout_if_logged_in
 
   log "Attempting SP login for appId $SP_APPID (tenant $SP_TENANT)"
-  say "Running az login (SP)..."
+  say "Logging in..."
   if run_az "az login (SP)" -- az login --service-principal \
-        --username "$SP_APPID" \
-        --password "$SP_PASS" \
-        --tenant   "$SP_TENANT"
+        --username "$SP_APPID" --password "$SP_PASS" --tenant "$SP_TENANT"
   then
     CURRENT_LOGIN="$SP_APPID"
     log "SP login succeeded for $SP_APPID"
-    say "Logged in as SP: $SP_APPID"
-    say "Account summary:"
-    log_cmd az account show --output table
-    az account show --output table 2>/dev/null | tee -a "$LOG_FILE"
-    return 0
+    say "Login successful as $SP_APPID"
   else
-    err "SP login FAILED or timed out for $SP_APPID"
-    tail -n 40 "$LOG_FILE" || true
-    return 1
+    err "SP login failed for $SP_APPID"
+    say "Login failed — check $LOG_FILE for details."
   fi
 }
 
 # ---------------- Subscription / Vault / Secrets ----------------
-
 choose_subscription() {
-  if ! already_logged_in; then err "No active account info. Please login first."; return 1; fi
-
+  if ! already_logged_in; then say "Please login first."; return 1; fi
   local subs_json="$TMP_DIR/subs.json"
   log_cmd az account list --output json
-  if ! az account list --output json >"$subs_json" 2>>"$LOG_FILE"; then err "Unable to list subscriptions"; return 1; fi
+  az account list --output json >"$subs_json" 2>>"$LOG_FILE" || { say "Cannot list subscriptions."; return 1; }
 
   if ! command -v jq >/dev/null 2>&1; then
-    say "jq not found; showing raw table instead."
-    log_cmd az account list --output table
-    az account list --output table | tee -a "$LOG_FILE"
-    read -r -p "Paste subscription ID to set (or Enter to keep current): " sub_id
-    if [[ -n "$sub_id" ]]; then
-      run_az "az account set $sub_id" -- az account set --subscription "$sub_id" || { err "Unable to set subscription"; return 1; }
-      log "Active subscription set to $sub_id"
-    fi
-    return 0
+    az account list --output table
+    read -r -p "Enter subscription ID (Enter to skip): " sub_id
+    [[ -z "$sub_id" ]] && return 0
+    run_az "az account set $sub_id" -- az account set --subscription "$sub_id" || say "Failed to set subscription."
+    return
   fi
 
   mapfile -t SUB_NAMES < <(jq -r '.[].name' "$subs_json")
-  mapfile -t SUB_IDS   < <(jq -r '.[].id'   "$subs_json")
+  mapfile -t SUB_IDS   < <(jq -r '.[].id' "$subs_json")
 
-  if ((${#SUB_IDS[@]} <= 1)); then say "One or zero subscriptions visible; nothing to change."; return 0; fi
-
+  (( ${#SUB_IDS[@]} == 0 )) && { say "No subscriptions found."; return 0; }
   echo "Available subscriptions:"
-  for ((i=0; i<${#SUB_IDS[@]}; i++)); do printf "%2d) %s | %s\n" $((i+1)) "${SUB_NAMES[$i]}" "${SUB_IDS[$i]}"; done
-
-  read -r -p "Enter subscription number to set (or press Enter to keep current): " sub_choice
-  if [[ -z "$sub_choice" ]]; then say "Keeping current subscription."; return 0; fi
-  if [[ ! "$sub_choice" =~ ^[0-9]+$ ]]; then err "Invalid selection (not a number)."; return 1; fi
-  local idx=$((sub_choice-1)); if (( idx < 0 || idx >= ${#SUB_IDS[@]} )); then err "Invalid selection (out of range)."; return 1; fi
-  local sub_id="${SUB_IDS[$idx]}"
-  run_az "az account set $sub_id" -- az account set --subscription "$sub_id" || { err "Unable to set subscription"; return 1; }
-  log "Active subscription set to $sub_id"
+  for ((i=0;i<${#SUB_IDS[@]};i++)); do printf "%2d) %s | %s\n" $((i+1)) "${SUB_NAMES[$i]}" "${SUB_IDS[$i]}"; done
+  read -r -p "Choose subscription number: " sub_choice
+  [[ -z "$sub_choice" ]] && return 0
+  (( sub_choice<1 || sub_choice>${#SUB_IDS[@]} )) && { say "Invalid choice."; return 1; }
+  local sub_id="${SUB_IDS[$((sub_choice-1))]}"
+  run_az "az account set $sub_id" -- az account set --subscription "$sub_id"
+  log "Subscription set to $sub_id"
 }
-
-# ---------- Browsers (Vaults → Secrets → Secret detail) ----------
 
 vault_browser() {
   while true; do
     NAV_SIGNAL=""
-
     local vaults_json="$TMP_DIR/vaults.json"
     log_cmd az keyvault list --output json
-    if ! az keyvault list --output json > "$vaults_json" 2>>"$LOG_FILE"; then err "Failed to list vaults"; return 1; fi
+    az keyvault list --output json >"$vaults_json" 2>>"$LOG_FILE" || { say "Failed to list vaults."; return 1; }
 
     if ! command -v jq >/dev/null 2>&1; then
-      say "jq not found; showing vaults in table. Enter vault name manually, or 's' to search."
-      log_cmd az keyvault list --output table
-      az keyvault list --output table | tee -a "$LOG_FILE"
-      echo "  s) Search secret NAMES across ALL vaults (by substring)"
-      echo "  q) Back to Main Menu"
-      read -r -p "Enter vault name, or 's'/'q': " choice
-      if [[ "$choice" == "q" ]]; then return 0; fi
-      if [[ "$choice" == "s" ]]; then cross_vault_search; [[ "$NAV_SIGNAL" == "MAIN" ]] && { NAV_SIGNAL=""; return 0; }; continue; fi
-      VAULT_NAME="$choice"
-      if [[ -z "${VAULT_NAME:-}" ]]; then err "Empty vault name."; continue; fi
-      log "Selected vault: $VAULT_NAME"; echo "Selected vault: $VAULT_NAME"
-      secrets_browser "$VAULT_NAME" || true
-      [[ "$NAV_SIGNAL" == "MAIN" ]] && { NAV_SIGNAL=""; return 0; }
-      NAV_SIGNAL=""; continue
+      az keyvault list --output table
+      read -r -p "Vault name (or q): " VAULT_NAME
+      [[ "$VAULT_NAME" == "q" ]] && return 0
+      secrets_browser "$VAULT_NAME"
+      continue
     fi
 
     mapfile -t VAULT_NAMES < <(jq -r '.[].name' "$vaults_json")
     mapfile -t VAULT_URIS  < <(jq -r '.[].properties.vaultUri // ""' "$vaults_json")
-    if ((${#VAULT_NAMES[@]} == 0)); then echo "No Key Vaults found or insufficient permissions."; return 1; fi
 
-    echo; echo "Key Vaults (select one):"
-    for ((i=0; i<${#VAULT_NAMES[@]}; i++)); do uri="${VAULT_URIS[$i]:-}"; printf "%2d) %s (%s)\n" $((i+1)) "${VAULT_NAMES[$i]}" "$uri"; done
-    echo "  s) Search secret NAMES across ALL vaults (by substring)"
+    (( ${#VAULT_NAMES[@]} == 0 )) && { say "No Key Vaults found."; return 0; }
+
+    echo "Key Vaults:"
+    for ((i=0;i<${#VAULT_NAMES[@]};i++)); do printf "%2d) %s (%s)\n" $((i+1)) "${VAULT_NAMES[$i]}" "${VAULT_URIS[$i]}"; done
+    echo "  s) Search secret names across all vaults"
     echo "  q) Back to Main Menu"
-    read -r -p "Choose number, or 's'/'q': " vchoice
+    read -r -p "Choice: " vchoice
     [[ "$vchoice" == "q" ]] && return 0
-    if [[ "$vchoice" == "s" ]]; then cross_vault_search; [[ "$NAV_SIGNAL" == "MAIN" ]] && { NAV_SIGNAL=""; return 0; }; NAV_SIGNAL=""; continue; fi
-    if [[ ! "$vchoice" =~ ^[0-9]+$ ]]; then err "Invalid selection (not a number)."; continue; fi
-    local idx=$((vchoice-1)); if (( idx < 0 || idx >= ${#VAULT_NAMES[@]} )); then err "Invalid selection (out of range)."; continue; fi
+    [[ "$vchoice" == "s" ]] && { cross_vault_search; continue; }
+    (( vchoice<1 || vchoice>${#VAULT_NAMES[@]} )) && { say "Invalid."; continue; }
 
-    local chosen_vault="${VAULT_NAMES[$idx]}"
-    log "Selected vault: $chosen_vault"; echo "Selected vault: $chosen_vault"
-    secrets_browser "$chosen_vault" || true
-    [[ "$NAV_SIGNAL" == "MAIN" ]] && { NAV_SIGNAL=""; return 0; }
-    NAV_SIGNAL=""
+    local chosen="${VAULT_NAMES[$((vchoice-1))]}"
+    say "Selected vault: $chosen"
+    secrets_browser "$chosen"
   done
 }
 
 secrets_browser() {
   local vault="$1"
   while true; do
-    say "Listing secrets (table) for vault: $vault"
+    say "Listing secrets for vault: $vault"
     log_cmd az keyvault secret list --vault-name "$vault" --query "[].{Name:name}" -o table
-    az keyvault secret list --vault-name "$vault" --query "[].{Name:name}" -o table 2>>"$LOG_FILE" || { err "Failed to list secrets (table) for $vault"; return 1; }
+    az keyvault secret list --vault-name "$vault" --query "[].{Name:name}" -o table 2>>"$LOG_FILE" || { say "Failed to list."; return 1; }
 
     local secrets_tsv="$TMP_DIR/secrets.tsv"
-    log_cmd az keyvault secret list --vault-name "$vault" --query "[].name" -o tsv
-    if ! az keyvault secret list --vault-name "$vault" --query "[].name" -o tsv > "$secrets_tsv" 2>>"$LOG_FILE"; then err "Failed to list secret names for $vault"; return 1; fi
-    mapfile -t SECRET_NAMES < "$secrets_tsv"
-    if ((${#SECRET_NAMES[@]} == 0)); then echo "No secrets found or insufficient permissions."; return 0; fi
+    az keyvault secret list --vault-name "$vault" --query "[].name" -o tsv >"$secrets_tsv" 2>>"$LOG_FILE" || { say "Failed to list."; return 1; }
+    mapfile -t SECRET_NAMES <"$secrets_tsv"
+    (( ${#SECRET_NAMES[@]} == 0 )) && { say "No secrets."; return 0; }
 
     for s in "${SECRET_NAMES[@]}"; do log "ENUM: vault:${vault} secret_name:${s}"; done
-
-    echo; echo "Select a secret to view:"
-    for ((i=0; i<${#SECRET_NAMES[@]}; i++)); do printf "%2d) %s\n" $((i+1)) "${SECRET_NAMES[$i]}"; done
+    echo "Secrets:"
+    for ((i=0;i<${#SECRET_NAMES[@]};i++)); do printf "%2d) %s\n" $((i+1)) "${SECRET_NAMES[$i]}"; done
     echo "  b) Back to Vaults"
-    echo "  q) Back to Main Menu"
-    read -r -p "Your choice: " scol
-
-    if [[ "$scol" == "q" ]]; then NAV_SIGNAL="MAIN"; return 0; fi
-    if [[ "$scol" == "b" ]]; then NAV_SIGNAL="VAULTS"; return 0; fi
-    if [[ ! "$scol" =~ ^[0-9]+$ ]]; then err "Invalid selection (not a number)."; continue; fi
-    local idx=$((scol-1)); if (( idx < 0 || idx >= ${#SECRET_NAMES[@]} )); then err "Invalid selection (out of range)."; continue; fi
-
-    secret_detail_loop "$vault" "$idx" SECRET_NAMES || true
-    if [[ "$NAV_SIGNAL" == "MAIN" ]]; then return 0; fi
-    if [[ "$NAV_SIGNAL" == "VAULTS" ]]; then NAV_SIGNAL=""; return 0; fi
-    NAV_SIGNAL=""
+    echo "  q) Main Menu"
+    read -r -p "Choice: " scol
+    [[ "$scol" == "q" ]] && NAV_SIGNAL="MAIN" && return 0
+    [[ "$scol" == "b" ]] && NAV_SIGNAL="VAULTS" && return 0
+    (( scol<1 || scol>${#SECRET_NAMES[@]} )) && { say "Invalid."; continue; }
+    secret_detail_loop "$vault" "$((scol-1))" SECRET_NAMES
   done
 }
 
@@ -243,191 +196,95 @@ secret_detail_loop() {
 
   while true; do
     local secret="${NAMES[$idx]}"
-    echo; echo "Secret [$((idx+1))/$total]: $secret (vault: $vault)"
-    echo "Actions:"
+    echo "Secret [$((idx+1))/$total]: $secret (vault: $vault)"
     echo "  1) Fetch and show VALUE"
     echo "  l) Back to Secrets List"
-    echo "  n) Next secret   p) Previous secret"
-    echo "  b) Back to Vaults    q) Main Menu"
-    read -r -p "Choose: " opt
-
+    echo "  n/p) Next/Previous secret"
+    echo "  b) Vaults   q) Main Menu"
+    read -r -p "Choice: " opt
     case "$opt" in
       1)
         log_cmd az keyvault secret show --vault-name "$vault" --name "$secret" --query value -o tsv
-        if az keyvault secret show --vault-name "$vault" --name "$secret" --query 'value' -o tsv > "$TMP_DIR/val" 2>>"$LOG_FILE"; then
+        if az keyvault secret show --vault-name "$vault" --name "$secret" --query 'value' -o tsv >"$TMP_DIR/val" 2>>"$LOG_FILE"; then
           secret_value="$(cat "$TMP_DIR/val")"
           echo "VALUE: $secret_value"
-          log "Fetched secret $secret (value displayed on-screen)"
+          log "Fetched secret $secret (value displayed)"
           [[ "$LOG_SECRET_VALUES" == "true" ]] && log "SECRET_VALUE: $secret = $secret_value"
-          read -r -p "Mark an account username to $READPASS_LOG for follow-up? (enter username or leave blank): " assoc_user
-          if [[ -n "$assoc_user" ]]; then
-            echo "$(timestamp) - $assoc_user - secret:$secret - vault:$vault" >> "$READPASS_LOG"
-            log "Marked $assoc_user in $READPASS_LOG"
-          fi
-          unset secret_value; rm -f "$TMP_DIR/val" || true
+          read -r -p "Mark username to $READPASS_LOG? (leave blank to skip): " assoc_user
+          [[ -n "$assoc_user" ]] && echo "$(timestamp) - $assoc_user - secret:$secret - vault:$vault" >>"$READPASS_LOG"
+          unset secret_value; rm -f "$TMP_DIR/val"
         else
-          err "Failed to fetch value for $secret"
+          say "Failed to fetch."
         fi
         ;;
       l|L) return 0 ;;
-      n|N) if (( idx + 1 < total )); then idx=$((idx+1)); else say "Already at the last secret."; fi ;;
-      p|P) if (( idx - 1 >= 0 )); then idx=$((idx-1)); else say "Already at the first secret."; fi ;;
+      n|N) (( idx+1<total )) && ((idx++)) || say "Last secret." ;;
+      p|P) (( idx>0 )) && ((idx--)) || say "First secret." ;;
       b|B) NAV_SIGNAL="VAULTS"; return 0 ;;
       q|Q) NAV_SIGNAL="MAIN"; return 0 ;;
-      *) echo "Invalid option." ;;
+      *) say "Invalid." ;;
     esac
   done
 }
 
-# -------- Cross-vault secret name search (by substring) --------
 cross_vault_search() {
-  read -r -p "Enter substring to find in secret NAMES (case-insensitive): " filter_substr
-  if [[ -z "$filter_substr" ]]; then say "Empty filter; cancelled."; NAV_SIGNAL=""; return 0; fi
-  log "SEARCH_FILTER: substr:${filter_substr}"
-
+  read -r -p "Enter substring to find in secret names: " filter
+  [[ -z "$filter" ]] && { say "Empty."; return; }
+  log "SEARCH_FILTER:${filter}"
   local VAULTS_ALL=()
-  if command -v jq >/dev/null 2>&1; then
-    local vaults_json="$TMP_DIR/vaults_all.json"
-    log_cmd az keyvault list --output json
-    if ! az keyvault list --output json > "$vaults_json" 2>>"$LOG_FILE"; then err "Failed to list vaults"; NAV_SIGNAL=""; return 1; fi
-    mapfile -t VAULTS_ALL < <(jq -r '.[].name' "$vaults_json")
-  else
-    log_cmd az keyvault list --query "[].name" -o tsv
-    if ! az keyvault list --query "[].name" -o tsv > "$TMP_DIR/vaults.tsv" 2>>"$LOG_FILE"; then err "Failed to list vaults"; NAV_SIGNAL=""; return 1; fi
-    mapfile -t VAULTS_ALL < "$TMP_DIR/vaults.tsv"
-  fi
-  if ((${#VAULTS_ALL[@]} == 0)); then echo "No Key Vaults found or insufficient permissions."; NAV_SIGNAL=""; return 0; fi
+  log_cmd az keyvault list --query "[].name" -o tsv
+  az keyvault list --query "[].name" -o tsv >"$TMP_DIR/vaults.tsv" 2>>"$LOG_FILE" || { say "Failed."; return; }
+  mapfile -t VAULTS_ALL <"$TMP_DIR/vaults.tsv"
+  (( ${#VAULTS_ALL[@]} == 0 )) && { say "No vaults."; return; }
 
-  local RES_VAULTS=(); local RES_SECRETS=()
-  echo; echo "=== Search results for \"$filter_substr\" across all vaults ==="
+  echo "Search results for \"$filter\":"
   for v in "${VAULTS_ALL[@]}"; do
-    log_cmd az keyvault secret list --vault-name "$v" --query "[].name" -o tsv
-    if az keyvault secret list --vault-name "$v" --query "[].name" -o tsv > "$TMP_DIR/names.tsv" 2>>"$LOG_FILE"; then
-      mapfile -t HITS < <(grep -iF -- "$filter_substr" "$TMP_DIR/names.tsv" || true)
-      if ((${#HITS[@]} > 0)); then
-        echo; echo "Vault: $v"
-        for nm in "${HITS[@]}"; do
-          printf "  - %s\n" "$nm"
-          log "ENUM_SEARCH: vault:${v} secret_name:${nm} substr:${filter_substr}"
-          RES_VAULTS+=("$v"); RES_SECRETS+=("$nm")
-        done
-      fi
-    else
-      log "Failed to list secrets for vault ${v} during search"
-    fi
-  done
-
-  if ((${#RES_SECRETS[@]} == 0)); then echo; echo "(No matching secret names found.)"; NAV_SIGNAL=""; return 0; fi
-
-  while true; do
-    echo; echo "Open a result by number, or:"
-    echo "  r) New search"
-    echo "  b) Back to Vaults"
-    echo "  q) Main Menu"
-    for ((k=0; k<${#RES_SECRETS[@]}; k++)); do printf "%3d) %s :: %s\n" $((k+1)) "${RES_VAULTS[$k]}" "${RES_SECRETS[$k]}"; done
-    read -r -p "Your choice: " choice
-    case "$choice" in
-      q) NAV_SIGNAL="MAIN"; return 0 ;;
-      b) NAV_SIGNAL="VAULTS"; return 0 ;;
-      r) cross_vault_search; return 0 ;;
-      *)
-        if [[ "$choice" =~ ^[0-9]+$ ]]; then
-          local sel=$((choice-1))
-          if (( sel >=0 && sel < ${#RES_SECRETS[@]} )); then
-            local v="${RES_VAULTS[$sel]}"; local s="${RES_SECRETS[$sel]}"
-            log_cmd az keyvault secret list --vault-name "$v" --query "[].name" -o tsv
-            if az keyvault secret list --vault-name "$v" --query "[].name" -o tsv > "$TMP_DIR/view.tsv" 2>>"$LOG_FILE"; then
-              mapfile -t VIEW_NAMES < <(grep -iF -- "$filter_substr" "$TMP_DIR/view.tsv" || true)
-              local start_idx=-1; for ((i=0;i<${#VIEW_NAMES[@]};i++)); do [[ "${VIEW_NAMES[$i]}" == "$s" ]] && { start_idx=$i; break; }; done
-              if (( start_idx == -1 )); then err "Selected secret not found in filtered view; refreshing search."; continue; fi
-              secret_detail_loop "$v" "$start_idx" VIEW_NAMES || true
-              if [[ "$NAV_SIGNAL" == "MAIN" || "$NAV_SIGNAL" == "VAULTS" ]]; then return 0; fi
-              NAV_SIGNAL=""; continue
-            else
-              err "Failed to rebuild filtered view for $v"; continue
-            fi
-          else
-            err "Invalid selection (out of range)."
-          fi
-        else
-          err "Invalid choice."
-        fi
-        ;;
-    esac
+    az keyvault secret list --vault-name "$v" --query "[].name" -o tsv >"$TMP_DIR/names.tsv" 2>>"$LOG_FILE" || continue
+    mapfile -t HITS < <(grep -iF -- "$filter" "$TMP_DIR/names.tsv" || true)
+    (( ${#HITS[@]} == 0 )) && continue
+    echo "Vault: $v"; for nm in "${HITS[@]}"; do echo "  - $nm"; log "ENUM_SEARCH: vault:${v} secret:${nm} substr:${filter}"; done
   done
 }
 
-# -------- List all vaults and secret NAMES (no values) --------
 list_all_vaults_and_secret_names() {
-  if ! already_logged_in; then err "Please login first."; return 1; fi
-
-  say "Enumerating all Key Vaults and listing secret NAMES (no values)..."
-
-  local VAULTS_ALL=()
-  if command -v jq >/dev/null 2>&1; then
-    local vaults_json="$TMP_DIR/vaults_all.json"
-    log_cmd az keyvault list --output json
-    if ! az keyvault list --output json > "$vaults_json" 2>>"$LOG_FILE"; then err "Failed to list vaults"; return 1; fi
-    mapfile -t VAULTS_ALL < <(jq -r '.[].name' "$vaults_json")
-  else
-    log_cmd az keyvault list --query "[].name" -o tsv
-    if ! az keyvault list --query "[].name" -o tsv > "$TMP_DIR/vaults.tsv" 2>>"$LOG_FILE"; then err "Failed to list vaults"; return 1; fi
-    mapfile -t VAULTS_ALL < "$TMP_DIR/vaults.tsv"
-  fi
-
-  if ((${#VAULTS_ALL[@]} == 0)); then echo "No Key Vaults found or insufficient permissions."; return 0; fi
+  log_cmd az keyvault list --query "[].name" -o tsv
+  az keyvault list --query "[].name" -o tsv >"$TMP_DIR/vaults.tsv" 2>>"$LOG_FILE" || { say "Failed."; return; }
+  mapfile -t VAULTS_ALL <"$TMP_DIR/vaults.tsv"
+  (( ${#VAULTS_ALL[@]} == 0 )) && { say "No vaults."; return; }
 
   for v in "${VAULTS_ALL[@]}"; do
-    echo; echo "=== Vault: $v ==="
-    log_cmd az keyvault secret list --vault-name "$v" --query "[].{Name:name}" -o table
-    if ! az keyvault secret list --vault-name "$v" --query "[].{Name:name}" -o table 2>>"$LOG_FILE" | tee -a "$LOG_FILE"; then
-      echo "(failed to list secrets for $v)"; log "Failed to list secrets (names) for $v"; continue
-    fi
-    log_cmd az keyvault secret list --vault-name "$v" --query "[].name" -o tsv
-    if az keyvault secret list --vault-name "$v" --query "[].name" -o tsv > "$TMP_DIR/names.tsv" 2>>"$LOG_FILE"; then
-      while IFS= read -r nm; do [[ -z "$nm" ]] && continue; log "ENUM: vault:${v} secret_name:${nm}"; done < "$TMP_DIR/names.tsv"
-    fi
+    echo "=== Vault: $v ==="
+    az keyvault secret list --vault-name "$v" --query "[].{Name:name}" -o table 2>>"$LOG_FILE" | tee -a "$LOG_FILE"
   done
-
-  say "Completed listing secret names for all vaults."
 }
-
-# ---------------- Menu ----------------
 
 main_menu() {
   while true; do
-    echo; echo "Main Menu:"
-    echo "  1) SP Login (service-principal)"
+    echo
+    echo "Main Menu:"
+    echo "  1) SP Login"
     echo "  2) Choose subscription"
-    echo "  3) Browse vaults → (or search) → secrets → secret details"
-    echo "  4) Show logs (last 200 lines)"
-    echo "  5) Logout (if logged in)"
-    echo "  6) Show ALL vaults and their secret NAMES (no values)"
+    echo "  3) Browse vaults → secrets"
+    echo "  4) Show logs"
+    echo "  5) Logout"
+    echo "  6) List ALL vaults & secret names"
     echo "  7) Exit"
-    read -r -p "Choose 1-7: " m
-    case "$m" in
-      1) sp_login_interactive || echo "SP login failed; check $LOG_FILE" ;;
+    read -r -p "Choice: " c
+    case "$c" in
+      1) sp_login_interactive ;;
       2) choose_subscription ;;
-      3) if ! already_logged_in; then err "Please login first."; else vault_browser; fi ;;
-      4)
-        echo "----- $LOG_FILE -----"; tail -n 200 "$LOG_FILE" || true
-        echo; echo "----- $READPASS_LOG -----"; tail -n 200 "$READPASS_LOG" || true
-        ;;
-      5) if already_logged_in; then logout_if_logged_in; say "Logged out."; CURRENT_LOGIN="unset"; else say "No active session."; fi ;;
+      3) already_logged_in || { say "Please login first."; continue; }; vault_browser ;;
+      4) tail -n 200 "$LOG_FILE" ;;
+      5) logout_if_logged_in; CURRENT_LOGIN="unset"; say "Logged out." ;;
       6) list_all_vaults_and_secret_names ;;
       7) log "Exiting."; break ;;
-      *) echo "Invalid option" ;;
+      *) say "Invalid." ;;
     esac
   done
 }
 
 # ---------------- Start ----------------
 log "Script started by $(whoami)"
-if ! command -v az >/dev/null 2>&1; then err "az CLI not found. Install azure-cli and retry."; exit 1; fi
-
 log_cmd az version
-log "az version: $(az version 2>/dev/null | tr -d '\n' | cut -c1-220 || echo 'unknown')"
-log "Proxy env: HTTP_PROXY=${HTTP_PROXY:-} HTTPS_PROXY=${HTTPS_PROXY:-} NO_PROXY=${NO_PROXY:-}"
-
 main_menu
 log "Script finished"
