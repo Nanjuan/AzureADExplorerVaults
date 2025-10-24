@@ -2,7 +2,7 @@
 # az_kv_sp_explorer.sh
 # Login as SP, list vaults, show secrets as a table, fetch values on demand,
 # optionally try logging in as another user/SP using a fetched value.
-# Logs to script.log (no secret values by default) and readPass.log (usernames only).
+# Logs to {date}.{time}.script.log (no secret values by default) and {date}.{time}.readPass.log (usernames only).
 
 set -o errexit
 set -o nounset
@@ -14,8 +14,11 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 1
 fi
 
-LOG_FILE="./script.log"
-READPASS_LOG="./readPass.log"
+# ----- timestamped log files -----
+START_STAMP="$(date +"%Y%m%d.%H%M%S")"
+LOG_FILE="./${START_STAMP}.script.log"
+READPASS_LOG="./${START_STAMP}.readPass.log"
+
 TMP_DIR="/tmp/az_kv_sp_explorer.$$"
 mkdir -p "$TMP_DIR"
 trap 'rm -rf "$TMP_DIR"' EXIT
