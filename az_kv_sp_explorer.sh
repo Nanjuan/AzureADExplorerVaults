@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # az_kv_sp_explorer.sh
-# Login as SP, list vaults, show secrets as a table, fetch values on demand,
+# Login as SP, list vaults, show secrets as a table (with optional filter), fetch values on demand,
 # optionally try logging in as another user/SP using a fetched value.
 # Logs to {date}.{time}.script.log (no secret values by default) and {date}.{time}.readPass.log (usernames only).
 
@@ -199,14 +199,12 @@ choose_subscription() {
 vault_browser() {
   # Loops: show vault list, pick vault, launch secrets browser, return to vault list
   while true; do
-    # Fetch vaults
     local vaults_json="$TMP_DIR/vaults.json"
     if ! az keyvault list --output json > "$vaults_json" 2>>"$LOG_FILE"; then
       err "Failed to list vaults"
       return 1
     fi
 
-    # jq fallback
     if ! command -v jq >/dev/null 2>&1; then
       say "jq not found; showing vaults in table. Enter vault name manually."
       az keyvault list --output table | tee -a "$LOG_FILE"
@@ -216,7 +214,6 @@ vault_browser() {
       log "Selected vault: $VAULT_NAME"
       echo "Selected vault: $VAULT_NAME"
       secrets_browser "$VAULT_NAME" || true
-      # after returning from secrets, loop back to show vault list again
       continue
     fi
 
@@ -251,75 +248,105 @@ vault_browser() {
     log "Selected vault: $chosen_vault"
     echo "Selected vault: $chosen_vault"
     secrets_browser "$chosen_vault" || true
-    # after secrets browser returns, loop to vault list again
   done
 }
 
 secrets_browser() {
-  # For a given vault: show table of names and allow selecting, next/prev, back
+  # For a given vault: show table of names and allow selecting, filter, next/prev, back
   local vault="$1"
 
+  # Load full list once
+  local secrets_tsv="$TMP_DIR/secrets.tsv"
+  if ! az keyvault secret list --vault-name "$vault" --query "[].name" -o tsv > "$secrets_tsv" 2>>"$LOG_FILE"; then
+    err "Failed to list secret names for $vault"
+    return 1
+  fi
+  mapfile -t SECRET_NAMES < "$secrets_tsv"
+  if ((${#SECRET_NAMES[@]} == 0)); then
+    echo "No secrets found or insufficient permissions."
+    return 0
+  fi
+  # Log enumeration of full set
+  for s in "${SECRET_NAMES[@]}"; do
+    log "ENUM: vault:${vault} secret_name:${s}"
+  done
+
+  local filter_substr=""
   while true; do
     say "Listing secrets (table) for vault: $vault"
+    # Show table (always full list, matching your original request)
     az keyvault secret list --vault-name "$vault" --query "[].{Name:name}" -o table 2>>"$LOG_FILE" || {
       err "Failed to list secrets (table) for $vault"
       return 1
     }
 
-    # Build numbered list (TSV)
-    local secrets_tsv="$TMP_DIR/secrets.tsv"
-    if ! az keyvault secret list --vault-name "$vault" --query "[].name" -o tsv > "$secrets_tsv" 2>>"$LOG_FILE"; then
-      err "Failed to list secret names for $vault"
-      return 1
+    # Build the view list based on active filter
+    local VIEW_NAMES=()
+    if [[ -z "$filter_substr" ]]; then
+      mapfile -t VIEW_NAMES < "$secrets_tsv"
+    else
+      # case-insensitive substring filter
+      mapfile -t VIEW_NAMES < <(grep -i -- "$filter_substr" "$secrets_tsv" || true)
+      log "FILTER_APPLIED: vault:${vault} substr:${filter_substr} matches:${#VIEW_NAMES[@]}"
+      # Log a light per-row view enumeration
+      for vs in "${VIEW_NAMES[@]}"; do
+        log "ENUM_VIEW: vault:${vault} secret_name:${vs}"
+      done
     fi
-    mapfile -t SECRET_NAMES < "$secrets_tsv"
-    if ((${#SECRET_NAMES[@]} == 0)); then
-      echo "No secrets found or insufficient permissions."
-      return 0
-    fi
-
-    # Log enumeration lines (vault + name)
-    for s in "${SECRET_NAMES[@]}"; do
-      log "ENUM: vault:${vault} secret_name:${s}"
-    done
 
     echo
-    echo "Select a secret to view:"
-    for ((i=0; i<${#SECRET_NAMES[@]}; i++)); do
-      printf "%2d) %s\n" $((i+1)) "${SECRET_NAMES[$i]}"
-    done
+    if [[ -n "$filter_substr" ]]; then
+      echo "Filter active: \"$filter_substr\"  (use 'c' to clear)"
+    fi
+    echo "Select a secret to view (filtered list below):"
+    if ((${#VIEW_NAMES[@]} == 0)); then
+      echo "  (no secrets match the current filter)"
+    else
+      for ((i=0; i<${#VIEW_NAMES[@]}; i++)); do
+        printf "%2d) %s\n" $((i+1)) "${VIEW_NAMES[$i]}"
+      done
+    fi
+    echo "  f) Filter by substring"
+    echo "  c) Clear filter"
     echo "  b) Back to Vaults"
     echo "  q) Back to Main Menu"
     read -r -p "Your choice: " scol
 
     [[ "$scol" == "q" ]] && return 0
     if [[ "$scol" == "b" ]]; then
-      # Go back to vaults list (by returning to caller)
       return 0
+    fi
+    if [[ "$scol" == "f" ]]; then
+      read -r -p "Enter substring to filter names (case-insensitive): " filter_substr
+      continue
+    fi
+    if [[ "$scol" == "c" ]]; then
+      filter_substr=""
+      say "Filter cleared."
+      continue
     fi
     if [[ ! "$scol" =~ ^[0-9]+$ ]]; then
       err "Invalid selection (not a number)."
       continue
     fi
     local idx=$((scol-1))
-    if (( idx < 0 || idx >= ${#SECRET_NAMES[@]} )); then
+    if (( idx < 0 || idx >= ${#VIEW_NAMES[@]} )); then
       err "Invalid selection (out of range)."
       continue
     fi
 
-    # Enter secret detail loop (with next/prev navigation)
-    secret_detail_loop "$vault" "$idx" SECRET_NAMES
-    # When it returns, we are back to the secrets table for the same vault
+    # Enter secret detail loop on the filtered view
+    secret_detail_loop "$vault" "$idx" VIEW_NAMES
+    # when it returns, we stay in this secrets list, preserving the filter
   done
 }
 
 secret_detail_loop() {
-  # argv: vault, start_index, array_name
+  # argv: vault, start_index, array_name (filtered view)
   local vault="$1"
   local idx="$2"
-  local arr_name="$3"   # name of array variable (SECRET_NAMES)
+  local arr_name="$3"   # name of array variable, e.g., VIEW_NAMES
 
-  # readonly ref to the array
   local -n NAMES="$arr_name"
   local total="${#NAMES[@]}"
 
@@ -373,7 +400,6 @@ secret_detail_loop() {
         fi
         ;;
       l|L)
-        # back to secrets list (caller loop)
         return 0
         ;;
       n|N)
@@ -391,13 +417,9 @@ secret_detail_loop() {
         fi
         ;;
       b|B)
-        # back to vaults (by returning to caller's caller: secrets_browser will return to vaults)
-        # Achieve by returning a special code (not strictly needed; we can just return and let secrets_browser return)
-        # Simpler: set a flag file and check in secrets_browser; but easier: echo and return 2
         return 2
         ;;
       q|Q)
-        # back to main menu: return special code 3
         return 3
         ;;
       *)
@@ -463,7 +485,7 @@ main_menu() {
     echo "Main Menu:"
     echo "  1) SP Login (service-principal)"
     echo "  2) Choose subscription"
-    echo "  3) Browse vaults → secrets → secret details (with navigation)"
+    echo "  3) Browse vaults → secrets (with filter) → secret details (with navigation)"
     echo "  4) Show logs (last 200 lines)"
     echo "  5) Logout (if logged in)"
     echo "  6) Show ALL vaults and their secret NAMES (no values)"
