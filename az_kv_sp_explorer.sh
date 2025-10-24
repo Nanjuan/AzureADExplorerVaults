@@ -369,6 +369,49 @@ inspect_secret_and_maybe_login() {
   esac
 }
 
+# -------- NEW: List all vaults and secret NAMES (no values) --------
+list_all_vaults_and_secret_names() {
+  if ! already_logged_in; then
+    err "Please login first."
+    return 1
+  fi
+
+  say "Enumerating all Key Vaults and listing secret NAMES (no values)..."
+
+  # Try jq path first for nicer output; else fallback to tsv
+  if command -v jq >/dev/null 2>&1; then
+    local vaults_json="$TMP_DIR/vaults_all.json"
+    if ! az keyvault list --output json > "$vaults_json" 2>>"$LOG_FILE"; then
+      err "Failed to list vaults"
+      return 1
+    fi
+    mapfile -t VAULTS_ALL < <(jq -r '.[].name' "$vaults_json")
+  else
+    if ! az keyvault list --query "[].name" -o tsv > "$TMP_DIR/vaults.tsv" 2>>"$LOG_FILE"; then
+      err "Failed to list vaults"
+      return 1
+    fi
+    mapfile -t VAULTS_ALL < "$TMP_DIR/vaults.tsv"
+  fi
+
+  if ((${#VAULTS_ALL[@]} == 0)); then
+    echo "No Key Vaults found or insufficient permissions."
+    return 0
+  fi
+
+  for v in "${VAULTS_ALL[@]}"; do
+    echo
+    echo "=== Vault: $v ==="
+    # Show secret names ONLY as a table and also log it
+    if ! az keyvault secret list --vault-name "$v" --query "[].{Name:name}" -o table 2>>"$LOG_FILE" | tee -a "$LOG_FILE"; then
+      echo "(failed to list secrets for $v)"
+      log "Failed to list secrets (names) for $v"
+    fi
+  done
+
+  say "Completed listing secret names for all vaults."
+}
+
 # ---------------- Menu ----------------
 
 main_menu() {
@@ -380,8 +423,9 @@ main_menu() {
     echo "  3) List vaults -> show secrets table -> fetch/act"
     echo "  4) Show logs (last 200 lines)"
     echo "  5) Logout (if logged in)"
-    echo "  6) Exit"
-    read -r -p "Choose 1-6: " m
+    echo "  6) Show ALL vaults and their secret NAMES (no values)"
+    echo "  7) Exit"
+    read -r -p "Choose 1-7: " m
     case "$m" in
       1) sp_login_interactive || echo "SP login failed; check $LOG_FILE" ;;
       2) choose_subscription ;;
@@ -406,6 +450,9 @@ main_menu() {
         fi
         ;;
       6)
+        list_all_vaults_and_secret_names
+        ;;
+      7)
         log "Exiting."
         break
         ;;
