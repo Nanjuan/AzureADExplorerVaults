@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # az_kv_sp_explorer.sh
-# Login as SP, list vaults, show secrets as a table, fetch values on demand,
+# Login as SP, list vaults, show secrets as a table (with cross-vault search), fetch values on demand,
 # optionally try logging in as another user/SP using a fetched value.
 # Logs to {date}.{time}.script.log (no secret values by default) and {date}.{time}.readPass.log (usernames only).
 
@@ -31,6 +31,10 @@ AZ_CMD_TIMEOUT_SECONDS="${AZ_CMD_TIMEOUT_SECONDS:-30}"
 
 # Track who we're logged in as (shown on every log line)
 CURRENT_LOGIN="unset"
+
+# Navigation signal for bubbling up without non-zero returns
+# "" = no special action, "MAIN" = go to main menu, "VAULTS" = go to vaults list
+NAV_SIGNAL=""
 
 timestamp(){ date +"%Y-%m-%d %H:%M:%S"; }
 log(){ echo "$(timestamp) - user:${CURRENT_LOGIN} - $*" | tee -a "$LOG_FILE"; }
@@ -197,8 +201,10 @@ choose_subscription() {
 # ---------- Browsers (Vaults → Secrets → Secret detail) ----------
 
 vault_browser() {
-  # Loops: show vault list, offer cross-vault search, pick vault, open secrets browser, return to vault list
+  # Loops: show vault list, offer cross-vault search, pick vault, open secrets browser, return to vault list or main
   while true; do
+    NAV_SIGNAL=""
+
     local vaults_json="$TMP_DIR/vaults.json"
     if ! az keyvault list --output json > "$vaults_json" 2>>"$LOG_FILE"; then
       err "Failed to list vaults"
@@ -209,14 +215,17 @@ vault_browser() {
       say "jq not found; showing vaults in table. Enter vault name manually, or 's' to search."
       az keyvault list --output table | tee -a "$LOG_FILE"
       echo "  s) Search secret NAMES across ALL vaults (by substring)"
-      read -r -p "Enter vault name, 's' to search, or 'q' to Main Menu: " choice
+      echo "  q) Back to Main Menu"
+      read -r -p "Enter vault name, or 's'/'q': " choice
       if [[ "$choice" == "q" ]]; then return 0; fi
-      if [[ "$choice" == "s" ]]; then cross_vault_search; continue; fi
+      if [[ "$choice" == "s" ]]; then cross_vault_search; [[ "$NAV_SIGNAL" == "MAIN" ]] && { NAV_SIGNAL=""; return 0; }; continue; fi
       VAULT_NAME="$choice"
       if [[ -z "${VAULT_NAME:-}" ]]; then err "Empty vault name."; continue; fi
       log "Selected vault: $VAULT_NAME"
       echo "Selected vault: $VAULT_NAME"
       secrets_browser "$VAULT_NAME" || true
+      [[ "$NAV_SIGNAL" == "MAIN" ]] && { NAV_SIGNAL=""; return 0; }
+      NAV_SIGNAL=""
       continue
     fi
 
@@ -238,7 +247,12 @@ vault_browser() {
     echo "  q) Back to Main Menu"
     read -r -p "Choose number, or 's'/'q': " vchoice
     [[ "$vchoice" == "q" ]] && return 0
-    if [[ "$vchoice" == "s" ]]; then cross_vault_search; continue; fi
+    if [[ "$vchoice" == "s" ]]; then
+      cross_vault_search
+      [[ "$NAV_SIGNAL" == "MAIN" ]] && { NAV_SIGNAL=""; return 0; }
+      NAV_SIGNAL=""
+      continue
+    fi
     if [[ ! "$vchoice" =~ ^[0-9]+$ ]]; then
       err "Invalid selection (not a number)."
       continue
@@ -253,11 +267,13 @@ vault_browser() {
     log "Selected vault: $chosen_vault"
     echo "Selected vault: $chosen_vault"
     secrets_browser "$chosen_vault" || true
+    [[ "$NAV_SIGNAL" == "MAIN" ]] && { NAV_SIGNAL=""; return 0; }
+    NAV_SIGNAL=""
   done
 }
 
 secrets_browser() {
-  # Given a vault: show secrets table, pick a secret → detail; no filtering here
+  # Given a vault: show secrets table, pick a secret → detail; 'b' back to vaults, 'q' back to MAIN
   local vault="$1"
 
   while true; do
@@ -293,10 +309,8 @@ secrets_browser() {
     echo "  q) Back to Main Menu"
     read -r -p "Your choice: " scol
 
-    [[ "$scol" == "q" ]] && return 0
-    if [[ "$scol" == "b" ]]; then
-      return 0
-    fi
+    if [[ "$scol" == "q" ]]; then NAV_SIGNAL="MAIN"; return 0; fi
+    if [[ "$scol" == "b" ]]; then NAV_SIGNAL="VAULTS"; return 0; fi
     if [[ ! "$scol" =~ ^[0-9]+$ ]]; then
       err "Invalid selection (not a number)."
       continue
@@ -307,8 +321,12 @@ secrets_browser() {
       continue
     fi
 
-    # Enter secret detail on full list (no filter)
-    secret_detail_loop "$vault" "$idx" SECRET_NAMES
+    # Enter secret detail on full list; guard non-zero with || true
+    secret_detail_loop "$vault" "$idx" SECRET_NAMES || true
+    # If user chose q in detail loop, jump to main; if b, go back to vaults; else stay
+    if [[ "$NAV_SIGNAL" == "MAIN" ]]; then return 0; fi
+    if [[ "$NAV_SIGNAL" == "VAULTS" ]]; then NAV_SIGNAL=""; return 0; fi
+    NAV_SIGNAL=""
   done
 }
 
@@ -370,25 +388,45 @@ secret_detail_loop() {
           err "Failed to fetch value for $secret"
         fi
         ;;
-      l|L) return 0 ;;
+      l|L)
+        # back to secrets list
+        return 0
+        ;;
       n|N)
-        if (( idx + 1 < total )); then idx=$((idx+1)); else say "Already at the last secret."; fi
+        if (( idx + 1 < total )); then
+          idx=$((idx+1))
+        else
+          say "Already at the last secret."
+        fi
         ;;
       p|P)
-        if (( idx - 1 >= 0 )); then idx=$((idx-1)); else say "Already at the first secret."; fi
+        if (( idx - 1 >= 0 )); then
+          idx=$((idx-1))
+        else
+          say "Already at the first secret."
+        fi
         ;;
-      b|B) return 2 ;;
-      q|Q) return 3 ;;
-      *) echo "Invalid option." ;;
+      b|B)
+        NAV_SIGNAL="VAULTS"
+        return 0
+        ;;
+      q|Q)
+        NAV_SIGNAL="MAIN"
+        return 0
+        ;;
+      *)
+        echo "Invalid option."
+        ;;
     esac
   done
 }
 
-# -------- NEW: Cross-vault secret name search (by substring) --------
+# -------- Cross-vault secret name search (by substring) --------
 cross_vault_search() {
   read -r -p "Enter substring to find in secret NAMES (case-insensitive): " filter_substr
   if [[ -z "$filter_substr" ]]; then
     say "Empty filter; cancelled."
+    NAV_SIGNAL=""
     return 0
   fi
   log "SEARCH_FILTER: substr:${filter_substr}"
@@ -399,12 +437,14 @@ cross_vault_search() {
     local vaults_json="$TMP_DIR/vaults_all.json"
     if ! az keyvault list --output json > "$vaults_json" 2>>"$LOG_FILE"; then
       err "Failed to list vaults"
+      NAV_SIGNAL=""
       return 1
     fi
     mapfile -t VAULTS_ALL < <(jq -r '.[].name' "$vaults_json")
   else
     if ! az keyvault list --query "[].name" -o tsv > "$TMP_DIR/vaults.tsv" 2>>"$LOG_FILE"; then
       err "Failed to list vaults"
+      NAV_SIGNAL=""
       return 1
     fi
     mapfile -t VAULTS_ALL < "$TMP_DIR/vaults.tsv"
@@ -412,6 +452,7 @@ cross_vault_search() {
 
   if ((${#VAULTS_ALL[@]} == 0)); then
     echo "No Key Vaults found or insufficient permissions."
+    NAV_SIGNAL=""
     return 0
   fi
 
@@ -422,9 +463,9 @@ cross_vault_search() {
   echo
   echo "=== Search results for \"$filter_substr\" across all vaults ==="
   for v in "${VAULTS_ALL[@]}"; do
-    # Grab names for this vault, filter locally
     if az keyvault secret list --vault-name "$v" --query "[].name" -o tsv > "$TMP_DIR/names.tsv" 2>>"$LOG_FILE"; then
-      mapfile -t HITS < <(grep -i -- "$filter_substr" "$TMP_DIR/names.tsv" || true)
+      # Fixed-string grep so special chars in filter don't act as regex
+      mapfile -t HITS < <(grep -iF -- "$filter_substr" "$TMP_DIR/names.tsv" || true)
       if ((${#HITS[@]} > 0)); then
         echo
         echo "Vault: $v"
@@ -443,6 +484,7 @@ cross_vault_search() {
   if ((${#RES_SECRETS[@]} == 0)); then
     echo
     echo "(No matching secret names found.)"
+    NAV_SIGNAL=""
     return 0
   fi
 
@@ -453,14 +495,13 @@ cross_vault_search() {
     echo "  r) New search"
     echo "  b) Back to Vaults"
     echo "  q) Main Menu"
-    # Print compact index list
     for ((k=0; k<${#RES_SECRETS[@]}; k++)); do
       printf "%3d) %s :: %s\n" $((k+1)) "${RES_VAULTS[$k]}" "${RES_SECRETS[$k]}"
     done
     read -r -p "Your choice: " choice
     case "$choice" in
-      q) return 0 ;;
-      b) return 0 ;;
+      q) NAV_SIGNAL="MAIN"; return 0 ;;
+      b) NAV_SIGNAL="VAULTS"; return 0 ;;
       r) cross_vault_search; return 0 ;;
       *)
         if [[ "$choice" =~ ^[0-9]+$ ]]; then
@@ -468,10 +509,9 @@ cross_vault_search() {
           if (( sel >=0 && sel < ${#RES_SECRETS[@]} )); then
             local v="${RES_VAULTS[$sel]}"
             local s="${RES_SECRETS[$sel]}"
-            # Build a filtered view for just this vault so next/prev makes sense
+            # Build filtered view for this vault (fixed-string match)
             if az keyvault secret list --vault-name "$v" --query "[].name" -o tsv > "$TMP_DIR/view.tsv" 2>>"$LOG_FILE"; then
-              mapfile -t VIEW_NAMES < <(grep -i -- "$filter_substr" "$TMP_DIR/view.tsv" || true)
-              # find index of selected 's' within VIEW_NAMES
+              mapfile -t VIEW_NAMES < <(grep -iF -- "$filter_substr" "$TMP_DIR/view.tsv" || true)
               local start_idx=-1
               for ((i=0;i<${#VIEW_NAMES[@]};i++)); do
                 if [[ "${VIEW_NAMES[$i]}" == "$s" ]]; then start_idx=$i; break; fi
@@ -480,9 +520,9 @@ cross_vault_search() {
                 err "Selected secret not found in filtered view; refreshing search."
                 continue
               fi
-              # Enter detail loop on that filtered view
-              secret_detail_loop "$v" "$start_idx" VIEW_NAMES
-              # After returning, continue to show this same result list
+              secret_detail_loop "$v" "$start_idx" VIEW_NAMES || true
+              if [[ "$NAV_SIGNAL" == "MAIN" || "$NAV_SIGNAL" == "VAULTS" ]]; then return 0; fi
+              NAV_SIGNAL=""
               continue
             else
               err "Failed to rebuild filtered view for $v"
