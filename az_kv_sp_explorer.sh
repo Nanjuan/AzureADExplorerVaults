@@ -106,15 +106,6 @@ run_az() {
 
 already_logged_in() { az account show >/dev/null 2>&1; }
 
-# Manual logout still available (not used automatically)
-logout_if_logged_in() {
-  if already_logged_in; then
-    log "Manual logout requested."
-    say "Logging out Azure session..."
-    run_az "az logout" -- az logout || true
-  fi
-}
-
 # ===== Capture toggle helpers (functions-only capture) =====
 capture_enable() {
   read -r -p "Enter TXT filename to capture function outputs (append mode): " CAPTURE_FILE
@@ -151,8 +142,7 @@ reuse_or_login_sp() {
   # Args: SP_APPID SP_PASS SP_TENANT
   local SP_APPID="$1"; local SP_PASS="$2"; local SP_TENANT="$3"
 
-  # 1) Check if ANY account in the machine sessions matches this SP (no jq needed)
-  #    If found, set that subscription active and reuse.
+  # 1) Check if ANY account in the machine sessions matches this SP
   local existing_sub_id=""
   existing_sub_id="$(az account list --all \
     --query "[?user.type=='servicePrincipal' && user.name=='${SP_APPID}'].id | [0]" -o tsv 2>/dev/null || true)"
@@ -217,7 +207,7 @@ sp_login_interactive() {
     read -r -p "Tenant ID (or domain): " SP_TENANT
   fi
 
-  # IMPORTANT: Do NOT auto-logout. Reuse if present, else login.
+  # Do NOT auto-logout. Reuse if present, else login.
   reuse_or_login_sp "$SP_APPID" "$SP_PASS" "$SP_TENANT"
 }
 
@@ -569,6 +559,97 @@ list_all_vaults_and_secret_names() {
   done
 }
 
+# -------- Selective logout (list accounts and choose which to logout) --------
+list_and_select_logout() {
+  say "Querying signed-in Azure accounts..."
+  # TSV: Name[TAB]Type[TAB]Tenant[TAB]Sub
+  local acct_tsv="$TMP_DIR/accounts.tsv"
+  log_cmd az account list --all --query "[].{Name:user.name,Type:user.type,Tenant:tenantId,Sub:id}" -o tsv
+  if ! az account list --all --query "[].{Name:user.name,Type:user.type,Tenant:tenantId,Sub:id}" -o tsv > "$acct_tsv" 2>>"$LOG_FILE"; then
+    err "Failed to list accounts"
+    say "Failed to list accounts (see log)."
+    return 1
+  fi
+
+  if ! [[ -s "$acct_tsv" ]]; then
+    say "No active az logins found."
+    return 0
+  fi
+
+  # Deduplicate by Name|Type; count sessions; store a sample tenant
+  declare -A SEEN COUNT TENANT_SAMPLE
+  declare -a UNI_NAMES=() UNI_TYPES=()
+  while IFS=$'\t' read -r nm tp tn sub; do
+    [[ -z "${nm:-}" || -z "${tp:-}" ]] && continue
+    local key="${nm}|${tp}"
+    if [[ -z "${SEEN[$key]+x}" ]]; then
+      SEEN[$key]=1
+      COUNT[$key]=1
+      TENANT_SAMPLE[$key]="$tn"
+      UNI_NAMES+=("$nm")
+      UNI_TYPES+=("$tp")
+    else
+      COUNT[$key]=$(( ${COUNT[$key]} + 1 ))
+      # keep first tenant as sample
+    fi
+  done < "$acct_tsv"
+
+  if ((${#UNI_NAMES[@]} == 0)); then
+    say "No active az logins found."
+    return 0
+  fi
+
+  echo
+  echo "Signed-in accounts:"
+  for ((i=0; i<${#UNI_NAMES[@]}; i++)); do
+    key="${UNI_NAMES[$i]}|${UNI_TYPES[$i]}"
+    cnt="${COUNT[$key]:-1}"
+    tns="${TENANT_SAMPLE[$key]:-unknown}"
+    printf "%2d) %-40s %-18s tenant:%s sessions:%s\n" $((i+1)) "${UNI_NAMES[$i]}" "${UNI_TYPES[$i]}" "$tns" "$cnt"
+  done
+  echo "  all) Logout ALL above"
+  echo "   q) Cancel"
+  read -r -p "Select indices (e.g., '1 3 4'), 'all', or 'q': " selection
+  [[ "$selection" == "q" ]] && { say "Cancelled."; return 0; }
+
+  # Build list of usernames to logout
+  declare -a TO_LOGOUT=()
+  if [[ "$selection" == "all" ]]; then
+    for ((i=0; i<${#UNI_NAMES[@]}; i++)); do TO_LOGOUT+=("${UNI_NAMES[$i]}"); done
+  else
+    for tok in $selection; do
+      [[ "$tok" =~ ^[0-9]+$ ]] || { say "Ignoring invalid token: $tok"; continue; }
+      idx=$((tok-1))
+      if (( idx < 0 || idx >= ${#UNI_NAMES[@]} )); then
+        say "Index out of range: $tok"
+        continue
+      fi
+      TO_LOGOUT+=("${UNI_NAMES[$idx]}")
+    done
+  fi
+
+  if ((${#TO_LOGOUT[@]} == 0)); then
+    say "Nothing selected."
+    return 0
+  fi
+
+  # Perform targeted logouts
+  for uname in "${TO_LOGOUT[@]}"; do
+    say "Logging out: ${uname}"
+    if run_az "az logout --username ${uname}" -- az logout --username "$uname"; then
+      log "Logged out username:${uname}"
+      if [[ "$CURRENT_LOGIN" == "$uname" ]]; then
+        CURRENT_LOGIN="unset"
+      fi
+    else
+      err "Failed to logout username:${uname}"
+      say "  Failed to logout ${uname} (see log)."
+    fi
+  done
+
+  say "Logout operations complete."
+}
+
 # ---------------- Main Menu ----------------
 main_menu() {
   while true; do
@@ -578,7 +659,7 @@ main_menu() {
     echo "  2) Choose subscription"
     echo "  3) Browse vaults → (or search) → secrets → secret details"
     echo "  4) Show logs (last 200 lines)"
-    echo "  5) Logout (if logged in)"
+    echo "  5) Logout selected accounts"
     echo "  6) Show ALL vaults and their secret NAMES (no values)"
     echo "  7) Search across ALL vaults for secret NAMES matching a string and PRINT their VALUES"
     echo "  8) Exit"
@@ -598,10 +679,7 @@ main_menu() {
       4)
         run_maybe_capture bash -c 'echo "----- '"$LOG_FILE"' -----"; tail -n 200 "'"$LOG_FILE"'" || true; echo; echo "----- '"$READPASS_LOG"' -----"; tail -n 200 "'"$READPASS_LOG"'" || true'
         ;;
-      5)
-        run_maybe_capture logout_if_logged_in
-        if [[ "$CURRENT_LOGIN" != "unset" ]]; then CURRENT_LOGIN="unset"; fi
-        ;;
+      5) run_maybe_capture list_and_select_logout ;;
       6) run_maybe_capture list_all_vaults_and_secret_names ;;
       7) run_maybe_capture search_and_print_secret_values ;;
       8) log "Exiting."; break ;;
