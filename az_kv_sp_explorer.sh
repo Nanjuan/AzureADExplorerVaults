@@ -41,6 +41,31 @@ log(){ echo "$(timestamp) - user:${CURRENT_LOGIN} - $*" | tee -a "$LOG_FILE"; }
 err(){ echo "$(timestamp) - user:${CURRENT_LOGIN} - ERROR - $*" | tee -a "$LOG_FILE" >&2; }
 say(){ echo "[ $(timestamp) ] $*" >&2; }
 
+# --- NEW: Log commands with safe redaction ---
+log_cmd() {
+  # usage: log_cmd <prog> [args...]
+  # Redacts the token AFTER: --password | --client-secret | -p
+  local out=""
+  local redact_next=0
+  for arg in "$@"; do
+    if (( redact_next )); then
+      out+=" ***REDACTED***"
+      redact_next=0
+      continue
+    fi
+    case "$arg" in
+      --password|--client-secret|-p)
+        out+=" $(printf '%q' "$arg")"
+        redact_next=1
+        ;;
+      *)
+        out+=" $(printf '%q' "$arg")"
+        ;;
+    esac
+  done
+  log "CMD:${out# }"
+}
+
 run_az() {
   # usage: run_az "desc" -- <cmd> [args...]
   local desc="$1"; shift
@@ -50,6 +75,7 @@ run_az() {
   fi
   shift
   log "START: ${desc}"
+  log_cmd "$@"
   say "${desc} ..."
   if command -v timeout >/dev/null 2>&1; then
     if timeout "${AZ_CMD_TIMEOUT_SECONDS}s" "$@" >>"$LOG_FILE" 2>&1; then
@@ -107,6 +133,7 @@ sp_login_interactive() {
     log "SP login succeeded for $SP_APPID"
     say "Logged in as SP: $SP_APPID"
     say "Account summary:"
+    log_cmd az account show --output table
     az account show --output table 2>/dev/null | tee -a "$LOG_FILE"
     return 0
   else
@@ -132,6 +159,7 @@ login_with_secret_value_as_user() {
     log "Login succeeded for $try_user"
     say "Login succeeded for $try_user"
     say "Current account:"
+    log_cmd az account show --output table
     az account show --output table 2>/dev/null | tee -a "$LOG_FILE"
     return 0
   else
@@ -150,6 +178,7 @@ choose_subscription() {
   fi
 
   local subs_json="$TMP_DIR/subs.json"
+  log_cmd az account list --output json
   if ! az account list --output json >"$subs_json" 2>>"$LOG_FILE"; then
     err "Unable to list subscriptions"
     return 1
@@ -157,6 +186,7 @@ choose_subscription() {
 
   if ! command -v jq >/dev/null 2>&1; then
     say "jq not found; showing raw table instead."
+    log_cmd az account list --output table
     az account list --output table | tee -a "$LOG_FILE"
     read -r -p "Paste subscription ID to set (or Enter to keep current): " sub_id
     if [[ -n "$sub_id" ]]; then
@@ -206,6 +236,7 @@ vault_browser() {
     NAV_SIGNAL=""
 
     local vaults_json="$TMP_DIR/vaults.json"
+    log_cmd az keyvault list --output json
     if ! az keyvault list --output json > "$vaults_json" 2>>"$LOG_FILE"; then
       err "Failed to list vaults"
       return 1
@@ -213,6 +244,7 @@ vault_browser() {
 
     if ! command -v jq >/dev/null 2>&1; then
       say "jq not found; showing vaults in table. Enter vault name manually, or 's' to search."
+      log_cmd az keyvault list --output table
       az keyvault list --output table | tee -a "$LOG_FILE"
       echo "  s) Search secret NAMES across ALL vaults (by substring)"
       echo "  q) Back to Main Menu"
@@ -278,6 +310,7 @@ secrets_browser() {
 
   while true; do
     say "Listing secrets (table) for vault: $vault"
+    log_cmd az keyvault secret list --vault-name "$vault" --query "[].{Name:name}" -o table
     az keyvault secret list --vault-name "$vault" --query "[].{Name:name}" -o table 2>>"$LOG_FILE" || {
       err "Failed to list secrets (table) for $vault"
       return 1
@@ -285,6 +318,7 @@ secrets_browser() {
 
     # Build numbered list of names
     local secrets_tsv="$TMP_DIR/secrets.tsv"
+    log_cmd az keyvault secret list --vault-name "$vault" --query "[].name" -o tsv
     if ! az keyvault secret list --vault-name "$vault" --query "[].name" -o tsv > "$secrets_tsv" 2>>"$LOG_FILE"; then
       err "Failed to list secret names for $vault"
       return 1
@@ -353,6 +387,7 @@ secret_detail_loop() {
 
     case "$opt" in
       1)
+        log_cmd az keyvault secret show --vault-name "$vault" --name "$secret" --query value -o tsv
         if az keyvault secret show --vault-name "$vault" --name "$secret" --query 'value' -o tsv > "$TMP_DIR/val" 2>>"$LOG_FILE"; then
           secret_value="$(cat "$TMP_DIR/val")"
           echo "VALUE: $secret_value"
@@ -370,6 +405,7 @@ secret_detail_loop() {
         fi
         ;;
       2)
+        log_cmd az keyvault secret show --vault-name "$vault" --name "$secret" --query value -o tsv
         if az keyvault secret show --vault-name "$vault" --name "$secret" --query 'value' -o tsv > "$TMP_DIR/val" 2>>"$LOG_FILE"; then
           secret_value="$(cat "$TMP_DIR/val")"
           echo "Fetched secret value (not logged)."
@@ -435,6 +471,7 @@ cross_vault_search() {
   local VAULTS_ALL=()
   if command -v jq >/dev/null 2>&1; then
     local vaults_json="$TMP_DIR/vaults_all.json"
+    log_cmd az keyvault list --output json
     if ! az keyvault list --output json > "$vaults_json" 2>>"$LOG_FILE"; then
       err "Failed to list vaults"
       NAV_SIGNAL=""
@@ -442,6 +479,7 @@ cross_vault_search() {
     fi
     mapfile -t VAULTS_ALL < <(jq -r '.[].name' "$vaults_json")
   else
+    log_cmd az keyvault list --query "[].name" -o tsv
     if ! az keyvault list --query "[].name" -o tsv > "$TMP_DIR/vaults.tsv" 2>>"$LOG_FILE"; then
       err "Failed to list vaults"
       NAV_SIGNAL=""
@@ -463,6 +501,7 @@ cross_vault_search() {
   echo
   echo "=== Search results for \"$filter_substr\" across all vaults ==="
   for v in "${VAULTS_ALL[@]}"; do
+    log_cmd az keyvault secret list --vault-name "$v" --query "[].name" -o tsv
     if az keyvault secret list --vault-name "$v" --query "[].name" -o tsv > "$TMP_DIR/names.tsv" 2>>"$LOG_FILE"; then
       # Fixed-string grep so special chars in filter don't act as regex
       mapfile -t HITS < <(grep -iF -- "$filter_substr" "$TMP_DIR/names.tsv" || true)
@@ -509,7 +548,7 @@ cross_vault_search() {
           if (( sel >=0 && sel < ${#RES_SECRETS[@]} )); then
             local v="${RES_VAULTS[$sel]}"
             local s="${RES_SECRETS[$sel]}"
-            # Build filtered view for this vault (fixed-string match)
+            log_cmd az keyvault secret list --vault-name "$v" --query "[].name" -o tsv
             if az keyvault secret list --vault-name "$v" --query "[].name" -o tsv > "$TMP_DIR/view.tsv" 2>>"$LOG_FILE"; then
               mapfile -t VIEW_NAMES < <(grep -iF -- "$filter_substr" "$TMP_DIR/view.tsv" || true)
               local start_idx=-1
@@ -551,12 +590,14 @@ list_all_vaults_and_secret_names() {
   local VAULTS_ALL=()
   if command -v jq >/dev/null 2>&1; then
     local vaults_json="$TMP_DIR/vaults_all.json"
+    log_cmd az keyvault list --output json
     if ! az keyvault list --output json > "$vaults_json" 2>>"$LOG_FILE"; then
       err "Failed to list vaults"
       return 1
     fi
     mapfile -t VAULTS_ALL < <(jq -r '.[].name' "$vaults_json")
   else
+    log_cmd az keyvault list --query "[].name" -o tsv
     if ! az keyvault list --query "[].name" -o tsv > "$TMP_DIR/vaults.tsv" 2>>"$LOG_FILE"; then
       err "Failed to list vaults"
       return 1
@@ -572,11 +613,13 @@ list_all_vaults_and_secret_names() {
   for v in "${VAULTS_ALL[@]}"; do
     echo
     echo "=== Vault: $v ==="
+    log_cmd az keyvault secret list --vault-name "$v" --query "[].{Name:name}" -o table
     if ! az keyvault secret list --vault-name "$v" --query "[].{Name:name}" -o table 2>>"$LOG_FILE" | tee -a "$LOG_FILE"; then
       echo "(failed to list secrets for $v)"
       log "Failed to list secrets (names) for $v"
       continue
     fi
+    log_cmd az keyvault secret list --vault-name "$v" --query "[].name" -o tsv
     if az keyvault secret list --vault-name "$v" --query "[].name" -o tsv > "$TMP_DIR/names.tsv" 2>>"$LOG_FILE"; then
       while IFS= read -r nm; do
         [[ -z "$nm" ]] && continue
@@ -647,6 +690,7 @@ if ! command -v az >/dev/null 2>&1; then
   exit 1
 fi
 
+log_cmd az version
 log "az version: $(az version 2>/dev/null | tr -d '\n' | cut -c1-220 || echo 'unknown')"
 log "Proxy env: HTTP_PROXY=${HTTP_PROXY:-} HTTPS_PROXY=${HTTPS_PROXY:-} NO_PROXY=${NO_PROXY:-}"
 

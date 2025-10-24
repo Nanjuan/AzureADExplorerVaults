@@ -4,4 +4,4 @@
 - [x] Add another option that will show all the vaults and the secrests with a specific query added to it if the secrests name have the parameter pass by the user from a option. 
 - [x] after I looked at a secrets do not go all the way back to the main menu go back to the secrests table name and have the option to go back or to view the next secret. 
 - [x] For the loging file change the name to so it follow the {date}.{time}.{name of the logfile}
-- [ ] Modify so the logs show what commands was run for each section and option selected so that get log also to the logs files. 
+- [x] Modify so the logs show what commands was run for each section and option selected so that get log also to the logs files. 
